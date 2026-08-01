@@ -146,6 +146,8 @@ export function LimitsPage() {
                 zcode={usageLimits?.zcode}
                 opencodeGo={usageLimits?.opencodeGo}
                 qoder={usageLimits?.qoder}
+                volcengine={usageLimits?.volcengine}
+                deepseek={usageLimits?.deepseek}
                 order={prefs.order}
                 visibility={prefs.visibility}
                 displayMode={prefs.displayMode}

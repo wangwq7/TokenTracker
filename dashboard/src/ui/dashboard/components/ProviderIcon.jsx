@@ -329,6 +329,7 @@ const PROVIDER_LOGO_MAP = {
   "PI-GITHUB-COPILOT": "/brand-logos/pi.svg",
   "PI-COPILOT": "/brand-logos/pi.svg",
   QODER: "/brand-logos/qoder.svg",
+  VOLCENGINE: "/brand-logos/volcengine.svg",
 };
 
 // AnythingLLM publishes this compact mark in white. Keep the official asset

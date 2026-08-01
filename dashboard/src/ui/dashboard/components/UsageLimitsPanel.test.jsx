@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copy, setCopyLocale } from "../../../lib/copy";
 import { DE_LOCALE, EN_LOCALE, JA_LOCALE, KO_LOCALE, ZH_CN_LOCALE, ZH_TW_LOCALE } from "../../../lib/locale";
@@ -64,6 +64,63 @@ describe("UsageLimitsPanel", () => {
     expect(screen.getByText(/Claude API returned 403/)).toBeInTheDocument();
     expect(screen.getByText("Not connected")).toBeInTheDocument();
     expect(screen.getByText("Plan")).toBeInTheDocument();
+  });
+
+
+  it("renders Volcengine Agent Plan windows with real quota details", () => {
+    render(
+      <UsageLimitsPanel
+        volcengine={{
+          configured: true,
+          error: null,
+          plan_label: "Agent Plan Large",
+          primary_window: {
+            used_percent: 25,
+            reset_at: "2030-01-01T05:00:00.000Z",
+            limit_credits: 40,
+            used_credits: 10,
+            remaining_credits: 30,
+            unit: "AFP",
+          },
+          secondary_window: { used_percent: 20, reset_at: "2030-01-07T00:00:00.000Z" },
+          tertiary_window: { used_percent: 12.5, reset_at: "2030-02-01T00:00:00.000Z" },
+        }}
+        order={["volcengine"]}
+      />,
+    );
+
+    expect(screen.getByText("Volcengine Ark Agent Plan Large")).toBeInTheDocument();
+    expect(screen.getByText("5h")).toBeInTheDocument();
+    expect(screen.getByText("Weekly")).toBeInTheDocument();
+    expect(screen.getByText("Monthly")).toBeInTheDocument();
+    expect(screen.getByText("25%")).toBeInTheDocument();
+    const fiveHourRow = screen.getByText("5h").closest(".group");
+    expect(fiveHourRow).toHaveTextContent("30");
+    expect(fiveHourRow).toHaveTextContent("AFP");
+  });
+
+  it("renders DeepSeek multi-currency balances without a fake utilization bar", () => {
+    const { container } = render(
+      <UsageLimitsPanel
+        deepseek={{
+          configured: true,
+          error: null,
+          available: true,
+          balances: [
+            { currency: "CNY", amount: 12.34, granted_balance: 2, topped_up_balance: 10.34 },
+            { currency: "USD", amount: 1.5, granted_balance: 0, topped_up_balance: 1.5 },
+          ],
+        }}
+        order={["deepseek"]}
+      />,
+    );
+
+    expect(screen.getByText("DeepSeek")).toBeInTheDocument();
+    expect(screen.getByText("CNY")).toBeInTheDocument();
+    expect(screen.getByText("USD")).toBeInTheDocument();
+    expect(container.querySelectorAll("[data-deepseek-balance-row]")).toHaveLength(2);
+    expect(container.querySelector("[data-deepseek-balances] .h-1\\.5")).toBeNull();
+    expect(screen.queryByText(/12%/)).not.toBeInTheDocument();
   });
 
   it("renders Claude model-scoped weekly windows with their server-provided labels", () => {
@@ -428,6 +485,51 @@ describe("UsageLimitsPanel", () => {
 
     expect(copy("limits.provenance.fresh")).toBe(liveLabel);
     expect(copy("limits.provenance.stale")).toBe(staleLabel);
+  });
+
+  it("renders configured Codex accounts as independently expandable quota groups", () => {
+    render(
+      <UsageLimitsPanel
+        codex={{
+          configured: true,
+          error: null,
+          primary_window: { used_percent: 11, reset_at: 1_800_000_000, limit_window_seconds: 18000 },
+          accounts: [
+            {
+              configured: true,
+              error: null,
+              account_id: "account-alpha",
+              account_email: "a••••a@example.com",
+              plan_label: "Team",
+              primary_window: { used_percent: 11, reset_at: 1_800_000_000, limit_window_seconds: 18000 },
+            },
+            {
+              configured: true,
+              error: null,
+              account_id: "account-bravo",
+              account_email: "b••••o@example.com",
+              plan_label: "Team",
+              primary_window: { used_percent: 73, reset_at: 1_800_000_001, limit_window_seconds: 18000 },
+            },
+          ],
+        }}
+        order={["codex"]}
+      />,
+    );
+
+    const alpha = screen.getByText("Codex Team · a••••a@example.com").closest("[role='button']");
+    const bravo = screen.getByText("Codex Team · b••••o@example.com").closest("[role='button']");
+    expect(alpha).not.toBeNull();
+    expect(bravo).not.toBeNull();
+    expect(within(alpha).getByText("11%")).toBeInTheDocument();
+    expect(within(bravo).getByText("73%")).toBeInTheDocument();
+
+    fireEvent.click(alpha);
+    expect(alpha).toHaveAttribute("aria-expanded", "true");
+    expect(bravo).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(bravo);
+    expect(alpha).toHaveAttribute("aria-expanded", "false");
+    expect(bravo).toHaveAttribute("aria-expanded", "true");
   });
 
   it("renders Codex Spark quota windows through compact copy labels", () => {

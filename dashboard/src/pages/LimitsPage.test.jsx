@@ -19,10 +19,12 @@ vi.mock("../hooks/use-limits-display-prefs.js", () => ({
 }));
 
 vi.mock("../ui/dashboard/components/UsageLimitsPanel.jsx", () => ({
-  UsageLimitsPanel: ({ kimi, codex, displayMode }) => (
+  UsageLimitsPanel: ({ kimi, codex, volcengine, deepseek, displayMode }) => (
     <div data-testid="limits-panel" data-display-mode={displayMode ?? "absent"}>
       {kimi?.configured ? "Kimi connected" : "Kimi missing"}
       {codex?.configured ? " Codex connected" : ""}
+      {volcengine?.configured ? " Volcengine connected" : ""}
+      {deepseek?.configured ? " DeepSeek connected" : ""}
     </div>
   ),
 }));
@@ -72,6 +74,27 @@ describe("LimitsPage", () => {
     );
 
     expect(screen.getByText("Kimi connected")).toBeInTheDocument();
+  });
+
+
+  it("passes Volcengine and DeepSeek limits into the limits panel", () => {
+    useUsageLimitsMock.mockImplementation(() => ({
+      data: {
+        volcengine: { configured: true, error: null },
+        deepseek: { configured: true, error: null, balances: [{ currency: "CNY", amount: 8.88 }] },
+      },
+      error: null,
+      isLoading: false,
+    }));
+
+    render(
+      <MemoryRouter>
+        <LimitsPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("limits-panel")).toHaveTextContent("Volcengine connected");
+    expect(screen.getByTestId("limits-panel")).toHaveTextContent("DeepSeek connected");
   });
 
   it("uses matching preloaded limits as the hook initial state and skips the full skeleton", () => {

@@ -80,6 +80,43 @@ final class UsageLimitsRetentionTests: XCTestCase {
         XCTAssertFalse(response.hasAnyProviderWithoutError)
     }
 
+    func testVolcengineAndDeepSeekPayloadsDecodeNativeFields() throws {
+        let response = try decodeResponse(overrides: [
+            "volcengine": [
+                "configured": true,
+                "error": NSNull(),
+                "plan_label": "Agent Plan Large",
+                "primary_window": [
+                    "used_percent": 25.0,
+                    "reset_at": "2026-08-01T05:00:00Z",
+                    "limit_credits": 40.0,
+                    "used_credits": 10.0,
+                    "remaining_credits": 30.0,
+                    "unit": "AFP",
+                ],
+            ],
+            "deepseek": [
+                "configured": true,
+                "error": NSNull(),
+                "available": true,
+                "balances": [[
+                    "currency": "CNY",
+                    "amount": 8.88,
+                    "granted_balance": 1.0,
+                    "topped_up_balance": 7.88,
+                ]],
+            ],
+        ])
+
+        XCTAssertTrue(response.hasAnyProviderWithoutError)
+        XCTAssertEqual(response.volcengine?.planLabel, "Agent Plan Large")
+        XCTAssertEqual(response.volcengine?.primaryWindow?.remainingCredits, 30.0)
+        XCTAssertEqual(response.volcengine?.primaryWindow?.unit, "AFP")
+        XCTAssertEqual(response.deepseek?.available, true)
+        XCTAssertEqual(response.deepseek?.balances?.first?.amount, 8.88)
+        XCTAssertEqual(response.deepseek?.balances?.first?.toppedUpBalance, 7.88)
+    }
+
     // MARK: - displayRecord retention rule
 
     func testDisplayRecordAdoptsIncomingWhenNoCurrentRecord() throws {
@@ -151,6 +188,82 @@ final class UsageLimitsRetentionTests: XCTestCase {
         XCTAssertEqual(response.codex.primaryWindow?.usedPercent, 42)
         XCTAssertNil(response.codex.creditWindow)
         XCTAssertNil(response.codex.resetCredits)
+    }
+
+    func testCodexSecondAccountCountsAsUsableWhenPrimaryAccountErrors() throws {
+        let response = try decodeResponse(overrides: [
+            "codex": [
+                "configured": true,
+                "error": "primary account failed",
+                "accounts": [
+                    [
+                        "configured": true,
+                        "account_id": "account-alpha",
+                        "error": "primary account failed",
+                    ],
+                    [
+                        "configured": true,
+                        "account_id": "account-bravo",
+                        "primary_window": [
+                            "used_percent": 73,
+                            "reset_at": 1_782_000_001,
+                            "limit_window_seconds": 18_000,
+                        ],
+                    ],
+                ],
+            ],
+        ])
+
+        XCTAssertTrue(response.hasAnyProviderWithoutError)
+    }
+
+    func testCodexAccountsDecodeIndependentIdentityAndQuota() throws {
+        let response = try decodeResponse(overrides: [
+            "codex": [
+                "configured": true,
+                "account_id": "account-alpha",
+                "account_email": "a••••a@example.com",
+                "primary_window": [
+                    "used_percent": 11,
+                    "reset_at": 1_782_000_000,
+                    "limit_window_seconds": 18_000,
+                ],
+                "accounts": [
+                    [
+                        "configured": true,
+                        "account_id": "account-alpha",
+                        "account_email": "a••••a@example.com",
+                        "plan_label": "Team",
+                        "primary_window": [
+                            "used_percent": 11,
+                            "reset_at": 1_782_000_000,
+                            "limit_window_seconds": 18_000,
+                        ],
+                    ],
+                    [
+                        "configured": true,
+                        "account_id": "account-bravo",
+                        "account_email": "b••••o@example.com",
+                        "plan_label": "Team",
+                        "primary_window": [
+                            "used_percent": 73,
+                            "reset_at": 1_782_000_001,
+                            "limit_window_seconds": 18_000,
+                        ],
+                    ],
+                ],
+            ],
+        ])
+
+        let accounts = try XCTUnwrap(response.codex.accounts)
+        XCTAssertEqual(accounts.count, 2)
+        XCTAssertEqual(accounts[0].accountID, "account-alpha")
+        XCTAssertEqual(accounts[0].accountEmail, "a••••a@example.com")
+        XCTAssertEqual(accounts[0].primaryWindow?.usedPercent, 11)
+        XCTAssertEqual(accounts[1].accountID, "account-bravo")
+        XCTAssertEqual(accounts[1].accountEmail, "b••••o@example.com")
+        XCTAssertEqual(accounts[1].primaryWindow?.usedPercent, 73)
+        XCTAssertEqual(response.codex.primaryWindow?.usedPercent, 11)
     }
 
     func testCodexCreditWindowDecodesSpendControlFields() throws {

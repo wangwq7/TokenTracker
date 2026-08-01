@@ -112,7 +112,7 @@ final class WeeklyLimitResetDetectorTests: XCTestCase {
         XCTAssertEqual(readings.first?.resetAt, 1000)
     }
 
-    func testReadingsIncludeZCodeAndOpenCodeGoWindows() throws {
+    func testReadingsIncludeZCodeOpenCodeGoAndVolcengineWindows() throws {
         let json = """
         {
           "fetched_at": "2026-07-22T00:00:00Z",
@@ -136,6 +136,19 @@ final class WeeklyLimitResetDetectorTests: XCTestCase {
             "primary_window": { "used_percent": 10, "reset_at": "2026-07-22T05:00:00Z" },
             "secondary_window": { "used_percent": 20, "reset_at": "2026-07-29T00:00:00Z" },
             "tertiary_window": { "used_percent": 30, "reset_at": "2026-08-22T00:00:00Z" }
+          },
+          "volcengine": {
+            "configured": true,
+            "error": null,
+            "primary_window": { "used_percent": 25, "reset_at": "2026-07-22T05:00:00Z", "remaining_credits": 30, "unit": "AFP" },
+            "secondary_window": { "used_percent": 40, "reset_at": "2026-07-29T00:00:00Z" },
+            "tertiary_window": { "used_percent": 15, "reset_at": "2026-08-22T00:00:00Z" }
+          },
+          "deepseek": {
+            "configured": true,
+            "error": null,
+            "available": true,
+            "balances": [{ "currency": "CNY", "amount": 8.88 }]
           }
         }
         """
@@ -144,7 +157,11 @@ final class WeeklyLimitResetDetectorTests: XCTestCase {
 
         XCTAssertEqual(
             readings.map { "\($0.provider).\($0.windowLabel)" },
-            ["zcode.5h", "zcode.Weekly", "zcode.Tools", "opencodeGo.5h", "opencodeGo.Weekly", "opencodeGo.Monthly"]
+            [
+                "zcode.5h", "zcode.Weekly", "zcode.Tools",
+                "opencodeGo.5h", "opencodeGo.Weekly", "opencodeGo.Monthly",
+                "volcengine.5h", "volcengine.Weekly", "volcengine.Monthly",
+            ]
         )
     }
 
@@ -156,6 +173,8 @@ final class WeeklyLimitResetDetectorTests: XCTestCase {
         XCTAssertEqual(LimitResetProviderIconCatalog.svgFilename(for: "kimi"), "kimi.svg")
         XCTAssertEqual(LimitResetProviderIconCatalog.svgFilename(for: "opencodeGo"), "opencode.svg")
         XCTAssertEqual(LimitResetProviderIconCatalog.svgFilename(for: "qoder"), "qoder.svg")
+        XCTAssertEqual(LimitResetProviderIconCatalog.svgFilename(for: "volcengine"), "volcengine.svg")
+        XCTAssertNil(LimitResetProviderIconCatalog.svgFilename(for: "deepseek"))
         XCTAssertNil(LimitResetProviderIconCatalog.assetName(for: "unknown"))
         XCTAssertNil(LimitResetProviderIconCatalog.svgFilename(for: "unknown"))
     }

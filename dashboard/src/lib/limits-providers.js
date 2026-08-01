@@ -14,6 +14,8 @@ export const LIMIT_PROVIDER_IDS = [
   "zcode",
   "opencodeGo",
   "qoder",
+  "volcengine",
+  "deepseek",
 ];
 
 /** Keys for ProviderIcon — mono logos use inline SVG; colored logos use /brand-logos/. */
@@ -32,6 +34,8 @@ export const LIMIT_PROVIDER_ICON_KEYS = {
   // (Go is a paid subscription tracked via dashboard scrape).
   opencodeGo: "OPENCODE",
   qoder: "QODER",
+  volcengine: "VOLCENGINE",
+  deepseek: "DEEPSEEK",
 };
 
 export function limitProviderIconKey(id) {
@@ -64,6 +68,10 @@ export function limitProviderName(id) {
       return copy("limits.provider.opencode_go");
     case "qoder":
       return copy("limits.provider.qoder");
+    case "volcengine":
+      return copy("limits.provider.volcengine");
+    case "deepseek":
+      return copy("limits.provider.deepseek");
     default:
       return String(id || "");
   }

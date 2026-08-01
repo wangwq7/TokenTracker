@@ -32,6 +32,15 @@ enum Strings {
     static var serverPreparing: String { t("This usually takes a few seconds.", "通常只需要几秒钟。", "通常只需要幾秒鐘。", "通常は数秒で完了します。", "보통 몇 초 정도 걸립니다.") }
     static var loadingData: String { t("Loading data…", "正在加载数据…", "正在載入資料…", "データを読み込み中…", "데이터 불러오는 중…") }
     static var noData: String { t("No data", "暂无数据", "暫無資料", "データなし", "데이터 없음") }
+    static var deepSeekBalanceUnavailable: String {
+        t("Balance unavailable for API requests", "余额不足，API 暂不可用", "餘額不足，API 暫不可用", "残高不足のため API を利用できません", "잔액 부족으로 API를 사용할 수 없습니다")
+    }
+    static func deepSeekBalanceDetail(granted: String, toppedUp: String) -> String {
+        t("Granted \(granted) · topped up \(toppedUp)", "赠送 \(granted) · 充值 \(toppedUp)", "贈送 \(granted) · 儲值 \(toppedUp)", "付与 \(granted) · チャージ \(toppedUp)", "지급 \(granted) · 충전 \(toppedUp)")
+    }
+    static func volcengineQuotaDetail(used: String, limit: String, remaining: String, unit: String) -> String {
+        t("\(used) / \(limit) \(unit) used · \(remaining) left", "已用 \(used) / \(limit) \(unit) · 剩余 \(remaining)", "已用 \(used) / \(limit) \(unit) · 剩餘 \(remaining)", "\(used) / \(limit) \(unit) 使用 · 残り \(remaining)", "\(used) / \(limit) \(unit) 사용 · \(remaining) 남음")
+    }
     static var retryButton: String { t("Retry", "重试", "重試", "再試行", "다시 시도") }
     static var openDashboard: String { t("Open Dashboard", "打开仪表盘", "開啟儀表盤", "ダッシュボードを開く", "대시보드 열기") }
     static var menuDynamicIsland: String { t("Dynamic Island", "灵动岛", "靈動島", "ダイナミックアイランド", "다이나믹 아일랜드") }

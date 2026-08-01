@@ -161,6 +161,21 @@ export const PROVIDER_LIMIT_SPECS = {
       ];
     },
   },
+  volcengine: {
+    windows(data) {
+      return [
+        { key: "5h", labelKey: "limits.label.volcengine_5h", window: data.primary_window },
+        { key: "weekly", labelKey: "limits.label.volcengine_weekly", window: data.secondary_window },
+        { key: "monthly", labelKey: "limits.label.volcengine_monthly", window: data.tertiary_window },
+      ];
+    },
+  },
+  deepseek: {
+    extra: "deepseek_balance",
+    windows() {
+      return [];
+    },
+  },
 };
 
 /** Static copy() anchors for validate:copy — labels resolve at runtime via spec.labelKey. */
@@ -207,5 +222,9 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.opencode_go_monthly"),
     copy("limits.label.qoder_credits"),
     copy("limits.label.qoder_ultimate"),
+    copy("limits.label.volcengine_5h"),
+    copy("limits.label.volcengine_weekly"),
+    copy("limits.label.volcengine_monthly"),
+    copy("limits.volcengine_quota.detail"),
   ];
 }

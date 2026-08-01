@@ -1568,6 +1568,13 @@ struct ClawdCompanionView: View {
                 ("Ultimate Free Calls", qoder.secondaryWindow)
             ])
         }
+        if let volcengine = limits.volcengine {
+            generic("volcengine", configured: volcengine.configured, error: volcengine.error, windows: [
+                ("5h", volcengine.primaryWindow),
+                ("Weekly", volcengine.secondaryWindow),
+                ("Monthly", volcengine.tertiaryWindow)
+            ])
+        }
 
         return readings
             .filter { $0.usedPercent > 0 && $0.usedPercent < 100 }

@@ -11,7 +11,6 @@ const { promisify } = require("node:util");
 const {
   detectClaudeCodeSubscriptionDetails,
   readClaudeCodeAccessToken,
-  readCodexAccessToken,
   readCodexAuthBundle,
 } = require("./subscriptions");
 const {
@@ -28,6 +27,15 @@ const { fetchGrokLimits } = require("./grok-limits");
 const { fetchZcodeLimits } = require("./zcode-limits");
 const { fetchOpencodeGoLimits } = require("./opencode-go-limits");
 const { fetchQoderLimits } = require("./qoder-limits");
+const { fetchDeepSeekBalance } = require("./deepseek-limits");
+const { fetchVolcengineLimits } = require("./volcengine-limits");
+const {
+  codexTokenIdentity,
+  maskEmail,
+  readProviderCredentials,
+  updateCodexAccountTokens,
+  validateCodexAccount,
+} = require("./provider-credentials");
 const { fetchProviderServiceStatus } = require("./provider-status");
 const { readSqliteJsonRows, readSqliteJsonRowsAsync } = require("./sqlite-reader");
 
@@ -501,27 +509,41 @@ async function fetchCodexResetCreditList(fetchImpl, headers, timeoutMs = CODEX_R
 
 async function fetchCodexUsageLimits(
   accessToken,
-  { fetchImpl = fetch, accountId = null, providerTimeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS } = {},
+  {
+    fetchImpl = fetch,
+    accountId = null,
+    requireAccountMatch = false,
+    providerTimeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS,
+  } = {},
 ) {
   const headers = {
     Authorization: `Bearer ${accessToken}`,
     Accept: "application/json",
+    "User-Agent": "codex-cli",
   };
   // The wham endpoint rejects some plan tiers without an explicit account id — match
-  // CodexBar's request shape so free / multi-account users don't see opaque 4xx.
+  // the official Codex request shape so multi-account users never fall through to the
+  // server's default workspace.
   if (accountId) {
     headers["ChatGPT-Account-Id"] = accountId;
   }
 
   const startedAtMs = performance.now();
-  const usage = await withProviderTimeout(Promise.resolve()
-    .then(() => fetchImpl("https://chatgpt.com/backend-api/wham/usage", {
+  let usageRequest;
+  try {
+    usageRequest = Promise.resolve(fetchImpl("https://chatgpt.com/backend-api/wham/usage", {
       method: "GET",
       headers,
-    }))
+    }));
+  } catch (error) {
+    usageRequest = Promise.reject(error);
+  }
+  const usage = await withProviderTimeout(usageRequest
     .then(async (res) => {
       // 401/403/404 from wham means "no usage data available for this auth state" — render
-      // a neutral empty state instead of a red "Fetch failed" error.
+      // a neutral empty state instead of a red "Fetch failed" error for the legacy
+      // single-account fallback. Explicit TokenTracker accounts require an identity-bearing
+      // 200 response and are handled below.
       if (res.status === 401 || res.status === 403 || res.status === 404) {
         return { body: null, status: res.status };
       }
@@ -529,10 +551,21 @@ async function fetchCodexUsageLimits(
         throw new Error(`Codex API returned ${res.status}`);
       }
       return { body: await res.json(), status: res.status };
-    }), "Codex", providerTimeoutMs);
+    }), "Codex", Number.isFinite(providerTimeoutMs)
+      ? providerTimeoutMs + CODEX_RESET_CREDIT_LIST_TIMEOUT_GUARD_MS
+      : providerTimeoutMs);
   if (!usage.body) {
+    if (requireAccountMatch) {
+      const error = new Error(`Codex quota response did not confirm the configured account (${usage.status})`);
+      error.code = "CODEX_ACCOUNT_UNVERIFIED";
+      error.status = usage.status;
+      throw error;
+    }
     return {
       upstream_status: usage.status,
+      account_id: accountId || null,
+      account_email: null,
+      plan_type: null,
       primary_window: null,
       secondary_window: null,
       credit_window: null,
@@ -542,6 +575,20 @@ async function fetchCodexUsageLimits(
     };
   }
   const body = usage.body;
+  const responseAccountId = typeof body.account_id === "string" && body.account_id.trim()
+    ? body.account_id.trim()
+    : null;
+  if (accountId && responseAccountId && responseAccountId !== accountId) {
+    const error = new Error("Codex quota response account does not match the requested account");
+    error.code = "CODEX_ACCOUNT_MISMATCH";
+    throw error;
+  }
+  if (requireAccountMatch && (!accountId || responseAccountId !== accountId)) {
+    const error = new Error("Codex quota response did not confirm the configured account");
+    error.code = "CODEX_ACCOUNT_UNVERIFIED";
+    throw error;
+  }
+
   let resetCredits = normalizeCodexResetCredits(body.rate_limit_reset_credits);
   // This semi-private sibling endpoint is read-only; /wham/usage remains the stable count fallback.
   const remainingProviderBudgetMs = Number.isFinite(providerTimeoutMs) && providerTimeoutMs > 0
@@ -560,6 +607,9 @@ async function fetchCodexUsageLimits(
   }
   return {
     upstream_status: usage.status,
+    account_id: responseAccountId || accountId || null,
+    account_email: typeof body.email === "string" ? body.email.trim() || null : null,
+    plan_type: typeof body.plan_type === "string" ? body.plan_type.trim().toLowerCase() || null : null,
     ...normalizeCodexRateWindows(body.rate_limit || {}),
     credit_window: normalizeCodexCreditWindow(body.spend_control?.individual_limit),
     ...normalizeCodexSparkRateWindows(body.additional_rate_limits),
@@ -2422,6 +2472,8 @@ function normalizeCodexCachedLimits(
   const cached = {
     configured: true,
     error: null,
+    account_id: typeof raw?.account_id === "string" ? raw.account_id : null,
+    account_email: typeof raw?.account_email === "string" ? raw.account_email : null,
     plan_type: typeof raw?.plan_type === "string" ? raw.plan_type : null,
     primary_window: isCodexCacheWindowUsable(raw?.primary_window, { nowMs }) ? raw.primary_window : null,
     secondary_window: isCodexCacheWindowUsable(raw?.secondary_window, { nowMs }) ? raw.secondary_window : null,
@@ -2435,34 +2487,65 @@ function normalizeCodexCachedLimits(
   return hasCodexWindow(cached) ? cached : null;
 }
 
-function readCodexLimitsCache({ home, nowMs = Date.now(), maxAgeMs = CODEX_LIMITS_CACHE_MAX_AGE_MS } = {}) {
+function readCodexLimitsCache({
+  home,
+  accountId = null,
+  allowLegacyUnbound = false,
+  nowMs = Date.now(),
+  maxAgeMs = CODEX_LIMITS_CACHE_MAX_AGE_MS,
+} = {}) {
   const cachePath = resolveCodexLimitsCachePath({ home });
   try {
     const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-    return normalizeCodexCachedLimits(parsed?.codex, { nowMs, maxAgeMs });
+    let raw = null;
+    if (accountId) {
+      raw = Array.isArray(parsed?.accounts)
+        ? parsed.accounts.find((account) => account?.account_id === accountId)
+        : null;
+      if (!raw || raw.account_id !== accountId) return null;
+    } else if (allowLegacyUnbound) {
+      raw = parsed?.codex || null;
+    }
+    return normalizeCodexCachedLimits(raw, { nowMs, maxAgeMs });
   } catch (_error) {
     return null;
   }
 }
 
-function writeCodexLimitsCache(limits, { home, nowMs = Date.now() } = {}) {
+function writeCodexLimitsCache(limits, { home, accountId = null, nowMs = Date.now() } = {}) {
   if (!limits?.configured || limits.error || !hasCodexWindow(limits)) return;
   const cachePath = resolveCodexLimitsCachePath({ home });
-  const payload = {
-    codex: {
-      plan_type: limits.plan_type || null,
-      primary_window: limits.primary_window || null,
-      secondary_window: limits.secondary_window || null,
-      credit_window: limits.credit_window || null,
-      spark_primary_window: limits.spark_primary_window || null,
-      spark_secondary_window: limits.spark_secondary_window || null,
-      reset_credits: limits.reset_credits || null,
-      cached_at: new Date(nowMs).toISOString(),
-    },
+  const boundAccountId = accountId || limits.account_id || null;
+  const entry = {
+    account_id: boundAccountId,
+    account_email: limits.account_email || null,
+    plan_type: limits.plan_type || null,
+    primary_window: limits.primary_window || null,
+    secondary_window: limits.secondary_window || null,
+    credit_window: limits.credit_window || null,
+    spark_primary_window: limits.spark_primary_window || null,
+    spark_secondary_window: limits.spark_secondary_window || null,
+    reset_credits: limits.reset_credits || null,
+    cached_at: new Date(nowMs).toISOString(),
   };
+  let payload = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) payload = parsed;
+  } catch (_error) {}
+
+  if (boundAccountId) {
+    const accounts = Array.isArray(payload.accounts)
+      ? payload.accounts.filter((account) => account?.account_id !== boundAccountId)
+      : [];
+    payload.accounts = [...accounts, entry];
+  } else {
+    payload.codex = entry;
+  }
+
   try {
     fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-    const tmpPath = `${cachePath}.${process.pid}.tmp`;
+    const tmpPath = `${cachePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tmpPath, cachePath);
   } catch (_error) {}
@@ -2975,6 +3058,214 @@ function withPlanLabel(obj, raw, brand) {
   return { ...obj, plan_label: normalizePlanLabel(raw, brand) };
 }
 
+function addLimitsProvenance(provider, fetchedAt, nowMs) {
+  if (!provider || typeof provider !== "object") return provider;
+  const capturedAt = provider.cached_at || fetchedAt;
+  const ageMs = Math.max(0, nowMs - Date.parse(capturedAt || ""));
+  const stale = provider.stale === true || (Number.isFinite(ageMs) && ageMs > 10 * 60 * 1000);
+  const explicitSource = typeof provider.source === "string" ? provider.source : "";
+  const source = explicitSource || (stale ? "disk-cache" : "provider-api");
+  const confidence = /estimate|inferred/i.test(source)
+    ? "inferred"
+    : /local|database|sqlite|cache/i.test(source)
+      ? "observed"
+      : "official";
+  provider.provenance = {
+    source,
+    confidence,
+    captured_at: capturedAt,
+    stale,
+    age_seconds: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
+  };
+  return provider;
+}
+
+function legacyCodexAuthToAccount(auth) {
+  if (!auth?.accessToken) return null;
+  const identity = codexTokenIdentity(auth.accessToken, auth.authJson?.tokens?.id_token);
+  return {
+    accountId: auth.accountId || identity.accessAccountId || identity.idAccountId || null,
+    email: identity.email || null,
+    accessToken: auth.accessToken,
+    idToken: auth.authJson?.tokens?.id_token || null,
+    refreshToken: auth.refreshToken || null,
+    lastRefresh: auth.lastRefresh || null,
+    planType: auth.planType || identity.planType || null,
+    authPath: auth.authPath,
+    authJson: auth.authJson,
+    managed: false,
+  };
+}
+
+function configuredCodexAccountToBundle(account) {
+  const identity = codexTokenIdentity(account.access_token, account.id_token);
+  return {
+    accountId: account.account_id,
+    email: identity.email || account.email || null,
+    accessToken: account.access_token,
+    idToken: account.id_token || null,
+    refreshToken: account.refresh_token || null,
+    lastRefresh: account.last_refresh || null,
+    planType: identity.planType || null,
+    managed: true,
+  };
+}
+
+async function loadCodexAccounts({ home, env } = {}) {
+  const stored = readProviderCredentials({ home }).codex.accounts;
+  if (stored.length > 0) {
+    const accounts = [];
+    for (const raw of stored) {
+      if (raw.disabled) continue;
+      try {
+        accounts.push(configuredCodexAccountToBundle(validateCodexAccount(raw)));
+      } catch (error) {
+        accounts.push({
+          accountId: raw.account_id || null,
+          email: raw.email || null,
+          planType: null,
+          managed: true,
+          credentialError: error,
+        });
+      }
+    }
+    return { accounts, explicit: true };
+  }
+  const legacy = legacyCodexAuthToAccount(await readCodexAuthBundle({ home, env }));
+  return { accounts: legacy ? [legacy] : [], explicit: false };
+}
+
+async function refreshCodexAccount(account, { home, fetchImpl, nowMs } = {}) {
+  if (!account?.accessToken || account.credentialError) {
+    return { account, refreshError: account?.credentialError || null };
+  }
+  if (!isTokenStale(account.lastRefresh, nowMs, account.accessToken) || !account.refreshToken) {
+    return { account, refreshError: null };
+  }
+  try {
+    const newTokens = await refreshCodexTokens({
+      refreshToken: account.refreshToken,
+      fetchImpl,
+    });
+    let lastRefresh;
+    if (account.managed) {
+      const updated = await updateCodexAccountTokens(account.accountId, newTokens, { home });
+      lastRefresh = updated.last_refresh;
+    } else {
+      const updatedAuth = await persistRefreshedAuth(account.authPath, account.authJson, newTokens);
+      lastRefresh = updatedAuth.last_refresh;
+    }
+    const identity = codexTokenIdentity(newTokens.access_token, newTokens.id_token || account.idToken);
+    if (account.accountId && identity.accessAccountId && identity.accessAccountId !== account.accountId) {
+      const error = new Error("Refreshed Codex token account does not match the configured account");
+      error.code = "CODEX_ACCOUNT_MISMATCH";
+      throw error;
+    }
+    return {
+      account: {
+        ...account,
+        email: identity.email || account.email,
+        accessToken: newTokens.access_token,
+        idToken: newTokens.id_token || account.idToken,
+        refreshToken: newTokens.refresh_token,
+        lastRefresh,
+        planType: identity.planType || account.planType,
+      },
+      refreshError: null,
+    };
+  } catch (refreshError) {
+    return { account, refreshError };
+  }
+}
+
+function codexAccountBase(account) {
+  return {
+    configured: true,
+    account_id: account?.accountId || null,
+    account_email: maskEmail(account?.email),
+  };
+}
+
+function assembleCodexAccountResult({
+  account,
+  result,
+  refreshError,
+  home,
+  nowMs,
+  allowLegacyUnboundCache = false,
+}) {
+  const base = codexAccountBase(account);
+  if (account?.credentialError) {
+    return { ...base, error: account.credentialError.message };
+  }
+  if (!account?.accessToken) {
+    return { ...base, error: "Codex access token is unavailable" };
+  }
+
+  const rejectedError = result?.status === "rejected" ? result.reason : null;
+  const accountMismatchError = [refreshError, rejectedError]
+    .find((error) => error?.code === "CODEX_ACCOUNT_MISMATCH");
+  if (accountMismatchError) {
+    return { ...base, error: accountMismatchError.message };
+  }
+
+  const refreshRequiresReauth = refreshError?.code === "REFRESH_TOKEN_EXPIRED";
+  const liveUsageSucceeded = result?.status === "fulfilled" && result.value.upstream_status === 200;
+  if (refreshRequiresReauth && !liveUsageSucceeded) {
+    return {
+      ...base,
+      error: refreshError.message,
+      auth_action_required: "reauth",
+    };
+  }
+
+  const identityError = [refreshError, rejectedError]
+    .find((error) => error?.code === "CODEX_ACCOUNT_UNVERIFIED");
+  if (identityError) {
+    return { ...base, error: identityError.message };
+  }
+
+  if (result?.status === "fulfilled") {
+    const value = result.value;
+    const planType = value.plan_type || account.planType || null;
+    const live = {
+      ...base,
+      error: null,
+      account_id: value.account_id || base.account_id,
+      account_email: maskEmail(value.account_email || account.email),
+      plan_type: planType,
+      primary_window: value.primary_window,
+      secondary_window: value.secondary_window,
+      credit_window: value.credit_window,
+      spark_primary_window: value.spark_primary_window,
+      spark_secondary_window: value.spark_secondary_window,
+      reset_credits: value.reset_credits,
+      stale: false,
+      cached_at: new Date(nowMs).toISOString(),
+    };
+    writeCodexLimitsCache(live, { home, accountId: account.accountId, nowMs });
+    return withPlanLabel(live, planType, "Codex");
+  }
+
+  const cached = readCodexLimitsCache({
+    home,
+    accountId: account.accountId,
+    allowLegacyUnbound: allowLegacyUnboundCache && !account.accountId,
+    nowMs,
+  });
+  if (cached) {
+    return withPlanLabel({
+      ...cached,
+      account_id: account.accountId || cached.account_id,
+      account_email: maskEmail(account.email) || cached.account_email,
+    }, cached.plan_type || account.planType, "Codex");
+  }
+  return {
+    ...base,
+    error: result?.reason?.message || refreshError?.message || "Unknown error",
+  };
+}
+
 // Single-flight guard: concurrent cache misses share one upstream fetch instead of
 // each triggering the full 9-provider round (Claude's OAuth usage endpoint 429s when
 // hammered). Survives an external resetUsageLimitsCache() (refresh=1 path in
@@ -3046,46 +3337,19 @@ async function fetchUsageLimitsUncached({
 } = {}) {
   const nowMs = Date.now();
 
-  const [claudeToken, claudeSubscription, codexAuth] = await Promise.all([
+  const [claudeToken, claudeSubscription, codexSource] = await Promise.all([
     Promise.resolve().then(() => readClaudeCodeAccessToken({ platform, securityRunner, home })),
     Promise.resolve().then(() => detectClaudeCodeSubscriptionDetails({ platform, securityRunner, home })),
-    readCodexAuthBundle({ home, env }),
+    loadCodexAccounts({ home, env }),
   ]);
   const claudePlanType = claudeSubscription?.planType || null;
 
-  // Match the official Codex CLI: prefer the access token's JWT expiry and refresh only
-  // within five minutes of it; fall back to last_refresh >8 days for opaque/legacy tokens.
-  // Best-effort: a refresh failure still falls through to the existing access token.
-  let refreshError = null;
-  let codexAuthRefreshed = codexAuth;
-  if (codexAuth
-    && isTokenStale(codexAuth.lastRefresh, nowMs, codexAuth.accessToken)
-    && codexAuth.refreshToken) {
-    try {
-      const newTokens = await refreshCodexTokens({
-        refreshToken: codexAuth.refreshToken,
-        fetchImpl,
-      });
-      const updatedAuth = await persistRefreshedAuth(
-        codexAuth.authPath,
-        codexAuth.authJson,
-        newTokens,
-      );
-      codexAuthRefreshed = {
-        ...codexAuth,
-        accessToken: newTokens.access_token,
-        refreshToken: newTokens.refresh_token,
-        lastRefresh: updatedAuth.last_refresh,
-        authJson: updatedAuth,
-      };
-    } catch (err) {
-      refreshError = err;
-    }
-  }
-
-  const codexToken = codexAuthRefreshed?.accessToken || null;
-  const codexAccountId = codexAuthRefreshed?.accountId || null;
-  const codexPlanType = codexAuthRefreshed?.planType || null;
+  // Each explicitly configured official account owns its access token, refresh token,
+  // account header, and cache entry. The legacy ~/.codex/auth.json path remains only when
+  // TokenTracker has no explicit Codex account list.
+  const codexAccountStates = await Promise.all(
+    codexSource.accounts.map((account) => refreshCodexAccount(account, { home, fetchImpl, nowMs })),
+  );
 
   // Skip the upstream Claude call entirely while a 429 cooldown is active — calling again
   // just renews the penalty. The result handling below serves cache or a cooldown message.
@@ -3100,23 +3364,25 @@ async function fetchUsageLimitsUncached({
     : null;
 
   const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs);
-  const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGo, qoder, claudeServiceStatus] = await Promise.all([
+  const [claudeResult, codexResults, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGo, qoder, volcengine, deepseek, claudeServiceStatus] = await Promise.all([
     claudeToken && !freshClaudeCache && !claudeRetryAtMs
       ? withProviderTimeout(fetchClaudeUsageLimits(claudeToken, { fetchImpl: providerFetch, maxAttempts: 1 }), "Claude", providerTimeoutMs).then(
           (value) => ({ status: "fulfilled", value }),
           (reason) => ({ status: "rejected", reason }),
         )
       : Promise.resolve(null),
-    codexToken
-      ? fetchCodexUsageLimits(codexToken, {
-          fetchImpl: providerFetch,
-          accountId: codexAccountId,
-          providerTimeoutMs,
-        }).then(
-          (value) => ({ status: "fulfilled", value }),
-          (reason) => ({ status: "rejected", reason }),
-        )
-      : Promise.resolve(null),
+    Promise.all(codexAccountStates.map(({ account }) => {
+      if (!account?.accessToken || account.credentialError) return Promise.resolve(null);
+      return fetchCodexUsageLimits(account.accessToken, {
+        fetchImpl,
+        accountId: account.accountId,
+        requireAccountMatch: codexSource.explicit,
+        providerTimeoutMs,
+      }).then(
+        (value) => ({ status: "fulfilled", value }),
+        (reason) => ({ status: "rejected", reason }),
+      );
+    })),
     withProviderTimeout(fetchCursorLimits({ home, fetchImpl: providerFetch }), "Cursor", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     withProviderTimeout(fetchKimiLimits({ home, env, fetchImpl: providerFetch }), "Kimi", providerTimeoutMs)
@@ -3144,6 +3410,16 @@ async function fetchUsageLimitsUncached({
         fetchImpl: providerFetch,
       }),
       "Qoder",
+      providerTimeoutMs,
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
+    withProviderTimeout(
+      fetchVolcengineLimits({ home, fetchImpl: providerFetch, timeoutMs: providerTimeoutMs, now }),
+      "Volcengine",
+      providerTimeoutMs,
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
+    withProviderTimeout(
+      fetchDeepSeekBalance({ home, fetchImpl: providerFetch, timeoutMs: providerTimeoutMs }),
+      "DeepSeek",
       providerTimeoutMs,
     ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     // Public status-page probe (fail-soft, own 5-min cache in provider-status.js).
@@ -3227,60 +3503,26 @@ async function fetchUsageLimitsUncached({
     claude.service_status = claudeServiceStatus;
   }
 
-  const codexRefreshRequiresReauth = refreshError?.code === "REFRESH_TOKEN_EXPIRED";
-  const codexLiveUsageSucceeded = codexResult?.status === "fulfilled"
-    && codexResult.value.upstream_status === 200;
-  let codex;
-  if (!codexToken) {
-    codex = { configured: false };
-  } else if (codexResult?.status === "fulfilled"
-    && (!codexRefreshRequiresReauth || codexLiveUsageSucceeded)) {
-    // A proactive refresh can fail while the existing access token is still valid.
-    // Prefer a confirmed 200 live usage read over the refresh error so usable quota
-    // data is not discarded before the access token actually expires. A neutral
-    // 401/403/404 no-data response must not mask a failed refresh.
-    codex = {
-      configured: true,
-      error: null,
-      plan_type: codexPlanType || null,
-      primary_window: codexResult.value.primary_window,
-      secondary_window: codexResult.value.secondary_window,
-      credit_window: codexResult.value.credit_window,
-      spark_primary_window: codexResult.value.spark_primary_window,
-      spark_secondary_window: codexResult.value.spark_secondary_window,
-      reset_credits: codexResult.value.reset_credits,
-      // Live read is current as of now; the stale fallback path below serves the
-      // disk cache with `stale: true`. Always emitting both lets the client show a
-      // data-age label uniformly (see the Claude live-success block).
-      stale: false,
-      cached_at: new Date(nowMs).toISOString(),
-    };
-    writeCodexLimitsCache(codex, { home, nowMs });
-  } else if (codexRefreshRequiresReauth) {
-    // Refresh token is dead — the user must re-run `codex` to log in again. Surface a
-    // specific, actionable message rather than the generic "Fetch failed", but only
-    // after the existing access token also failed to fetch live usage above.
-    codex = {
-      configured: true,
-      error: refreshError.message,
-      auth_action_required: "reauth",
-    };
-  } else if (!codexResult || codexResult.status === "rejected") {
-    // Live fetch failed or timed out (Codex hits chatgpt.com fresh every poll with no
-    // rate-limit cooldown, so a slow network shows up here often). Serve the last successful
-    // read so the bars stay visible instead of a red error, mirroring the Claude stale path.
-    const cached = readCodexLimitsCache({ home, nowMs });
-    if (cached) {
-      codex = cached;
-    } else {
-      codex = { configured: true, error: codexResult?.reason?.message || "Unknown error" };
-    }
-  }
+  const codexAccounts = codexAccountStates.map(({ account, refreshError }, index) =>
+    assembleCodexAccountResult({
+      account,
+      result: codexResults[index],
+      refreshError,
+      home,
+      nowMs,
+      allowLegacyUnboundCache: !codexSource.explicit,
+    }));
+  const firstCodexAccount = codexAccounts[0] || { configured: false };
+  const codex = {
+    ...firstCodexAccount,
+    configured: codexAccounts.length > 0,
+    accounts: codexAccounts,
+  };
 
   const data = {
     fetched_at: new Date(nowMs).toISOString(),
     claude: withPlanLabel(claude, claudePlanType, "Claude"),
-    codex: withPlanLabel(codex, codex.plan_type, "Codex"),
+    codex,
     cursor: withPlanLabel(cursor, cursor.membership_type, "Cursor"),
     // Kimi's subType (TYPE_PURCHASE/TYPE_EVENT) is the credit *source*, not a plan
     // tier, and membership.level is an opaque enum (LEVEL_INTERMEDIATE) with no
@@ -3295,27 +3537,18 @@ async function fetchUsageLimitsUncached({
     zcode: withPlanLabel(zcode, zcode.plan_label, "ZCode"),
     opencodeGo: withPlanLabel(opencodeGo, opencodeGo?.plan_label, "OpenCode Go"),
     qoder: withPlanLabel(qoder, qoder?.plan_label, "Qoder"),
+    volcengine: withPlanLabel(volcengine, volcengine?.plan_label, "Volcengine"),
+    deepseek,
   };
 
   for (const [providerName, provider] of Object.entries(data)) {
     if (providerName === "fetched_at" || !provider || typeof provider !== "object") continue;
-    const capturedAt = provider.cached_at || data.fetched_at;
-    const ageMs = Math.max(0, nowMs - Date.parse(capturedAt || ""));
-    const stale = provider.stale === true || (Number.isFinite(ageMs) && ageMs > 10 * 60 * 1000);
-    const explicitSource = typeof provider.source === "string" ? provider.source : "";
-    const source = explicitSource || (stale ? "disk-cache" : "provider-api");
-    const confidence = /estimate|inferred/i.test(source)
-      ? "inferred"
-      : /local|database|sqlite|cache/i.test(source)
-        ? "observed"
-        : "official";
-    provider.provenance = {
-      source,
-      confidence,
-      captured_at: capturedAt,
-      stale,
-      age_seconds: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
-    };
+    addLimitsProvenance(provider, data.fetched_at, nowMs);
+    if (providerName === "codex" && Array.isArray(provider.accounts)) {
+      for (const account of provider.accounts) {
+        addLimitsProvenance(account, data.fetched_at, nowMs);
+      }
+    }
   }
 
   cache = { data, expiresAtMs: cacheExpiresAtMs(data, nowMs) };

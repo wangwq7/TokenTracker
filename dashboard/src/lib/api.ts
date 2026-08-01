@@ -97,6 +97,7 @@ const PATHS = {
   userStatus: "tokentracker-user-status",
   localSync: "tokentracker-local-sync",
   usageLimits: "tokentracker-usage-limits",
+  providerCredentials: "tokentracker-provider-credentials",
   outcomes: "tokentracker-outcomes",
   sessionInsights: "tokentracker-session-insights",
   contextHealth: "tokentracker-context-health",
@@ -724,6 +725,45 @@ export async function getUsageMonthly({
 export async function getUsageLimits(opts: { refresh?: boolean } = {}) {
   const params = opts?.refresh ? { refresh: "1" } : undefined;
   return fetchLocalJson(PATHS.usageLimits, params);
+}
+
+async function requestProviderCredentials(method: "GET" | "POST" | "DELETE", body?: AnyRecord) {
+  const authHeaders = await getLocalApiAuthHeaders();
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...authHeaders,
+  };
+  if (body) headers["Content-Type"] = "application/json";
+  const response = await fetch(`/functions/${PATHS.providerCredentials}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+    cache: "no-store",
+  });
+  const payload = await response.json().catch(() => ({
+    ok: false,
+    error: `Provider credentials request failed with HTTP ${response.status}`,
+  }));
+  if (!response.ok || payload?.ok === false) {
+    const error: any = new Error(
+      payload?.error || `Provider credentials request failed with HTTP ${response.status}`,
+    );
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+export async function getProviderCredentials() {
+  return requestProviderCredentials("GET");
+}
+
+export async function saveProviderCredentials(provider: string, credentials: AnyRecord) {
+  return requestProviderCredentials("POST", { provider, credentials });
+}
+
+export async function deleteProviderCredentials(provider: string) {
+  return requestProviderCredentials("DELETE", { provider });
 }
 
 export async function getUsageHeatmap({

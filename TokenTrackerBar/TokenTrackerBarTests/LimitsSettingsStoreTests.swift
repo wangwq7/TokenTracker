@@ -9,6 +9,15 @@ final class LimitsSettingsStoreTests: XCTestCase {
         super.tearDown()
     }
 
+    func testDefaultProviderOrderIncludesVolcengineAndDeepSeekAfterQoder() {
+        XCTAssertEqual(
+            Array(LimitsSettingsStore.allProviders.suffix(4)),
+            ["opencodeGo", "qoder", "volcengine", "deepseek"]
+        )
+        XCTAssertEqual(LimitsSettingsStore.displayNames["volcengine"], "Volcengine Ark")
+        XCTAssertEqual(LimitsSettingsStore.displayNames["deepseek"], "DeepSeek")
+    }
+
     func testReorderMovingDownUsesOriginalDestinationOffset() {
         let order = LimitsSettingsStore.allProviders
 

@@ -2919,6 +2919,37 @@ function createLocalApiHandler({ queuePath }) {
       return true;
     }
 
+    // --- locally stored provider credentials (masked read; authenticated writes) ---
+    if (p === "/functions/tokentracker-provider-credentials") {
+      const method = String(req.method || "GET").toUpperCase();
+      if (!["GET", "POST", "PUT", "DELETE"].includes(method)) {
+        json(res, { ok: false, error: "Method Not Allowed" }, 405);
+        return true;
+      }
+      if (!isAuthorizedLocalMutation(req)) {
+        json(res, { ok: false, error: "Unauthorized" }, 401);
+        return true;
+      }
+      const credentials = require("./provider-credentials");
+      const home = os.homedir();
+      try {
+        if (method === "GET") {
+          json(res, { ok: true, providers: credentials.providerCredentialsSummary({ home }) });
+          return true;
+        }
+        const body = await readJsonBody(req);
+        const provider = body?.provider;
+        const providers = method === "DELETE"
+          ? await credentials.deleteProviderCredentials(provider, { home })
+          : await credentials.saveProviderCredentials(provider, body?.credentials, { home });
+        require("./usage-limits").resetUsageLimitsCache();
+        json(res, { ok: true, providers });
+      } catch (error) {
+        json(res, { ok: false, error: error?.message || "Provider credentials update failed" }, 400);
+      }
+      return true;
+    }
+
     // --- usage-limits ---
     if (p === "/functions/tokentracker-usage-limits") {
       const { getUsageLimits, resetUsageLimitsCache } = require("./usage-limits");

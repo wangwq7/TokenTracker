@@ -1466,3 +1466,36 @@ landing.v3.how.scene.files_changed,landing,LandingPage,HowItWorksSection,scene_f
 landing.v3.how.scene.session_title,landing,LandingPage,HowItWorksSection,scene_session_title,"session log · last turn",,active
 landing.v3.how.scene.appended,landing,LandingPage,HowItWorksSection,scene_appended,"appended locally",,active
 landing.v3.how.scene.total_tokens,landing,LandingPage,HowItWorksSection,scene_total_tokens,"total tokens",,active
+limits.provider.volcengine,ui,LimitsPage,UsageLimitsPanel,provider_volcengine,"Volcengine Ark",,active
+limits.provider.deepseek,ui,LimitsPage,UsageLimitsPanel,provider_deepseek,"DeepSeek",,active
+limits.label.volcengine_5h,ui,LimitsPage,UsageLimitsPanel,volcengine_5h,"5h",,active
+limits.label.volcengine_weekly,ui,LimitsPage,UsageLimitsPanel,volcengine_weekly,"Weekly",,active
+limits.label.volcengine_monthly,ui,LimitsPage,UsageLimitsPanel,volcengine_monthly,"Monthly",,active
+limits.volcengine_quota.detail,ui,LimitsPage,UsageLimitsPanel,volcengine_quota_detail,"{{used}} / {{limit}} AFP used · {{remaining}} left",,active
+limits.deepseek.unavailable,ui,LimitsPage,UsageLimitsPanel,deepseek_unavailable,"Balance unavailable for API requests",,active
+limits.deepseek.balance_detail,ui,LimitsPage,UsageLimitsPanel,deepseek_balance_detail,"Granted {{granted}} · topped up {{toppedUp}}",,active
+settings.provider_credentials.title,ui,SettingsPage,ProviderCredentialsPanel,title,"Provider Credentials",,active
+settings.provider_credentials.subtitle,ui,SettingsPage,ProviderCredentialsPanel,subtitle,"Stored locally by Token Tracker; saved secrets are never returned to the dashboard.",,active
+settings.provider_credentials.loading,ui,SettingsPage,ProviderCredentialsPanel,loading,"Loading provider credentials…",,active
+settings.provider_credentials.load_failed,ui,SettingsPage,ProviderCredentialsPanel,load_failed,"Unable to load provider credentials",,active
+settings.provider_credentials.configured,ui,SettingsPage,ProviderCredentialsPanel,configured,"Configured · {{hint}}",,active
+settings.provider_credentials.not_configured,ui,SettingsPage,ProviderCredentialsPanel,not_configured,"Not configured",,active
+settings.provider_credentials.deepseek_description,ui,SettingsPage,ProviderCredentialsPanel,deepseek_description,"Use an official DeepSeek API key to read the account balance.",,active
+settings.provider_credentials.volcengine_description,ui,SettingsPage,ProviderCredentialsPanel,volcengine_description,"Quota lookup requires the account AccessKey ID and Secret Access Key, not the Ark inference API key.",,active
+settings.provider_credentials.api_key,ui,SettingsPage,ProviderCredentialsPanel,api_key,"API Key",,active
+settings.provider_credentials.access_key_id,ui,SettingsPage,ProviderCredentialsPanel,access_key_id,"AccessKey ID",,active
+settings.provider_credentials.secret_access_key,ui,SettingsPage,ProviderCredentialsPanel,secret_access_key,"Secret Access Key",,active
+settings.provider_credentials.region,ui,SettingsPage,ProviderCredentialsPanel,region,"Region",,active
+settings.provider_credentials.deepseek_placeholder,ui,SettingsPage,ProviderCredentialsPanel,deepseek_placeholder,"Enter DeepSeek API key",,active
+settings.provider_credentials.access_key_placeholder,ui,SettingsPage,ProviderCredentialsPanel,access_key_placeholder,"Enter AccessKey ID",,active
+settings.provider_credentials.secret_key_placeholder,ui,SettingsPage,ProviderCredentialsPanel,secret_key_placeholder,"Enter Secret Access Key",,active
+settings.provider_credentials.secret_saved_placeholder,ui,SettingsPage,ProviderCredentialsPanel,secret_saved_placeholder,"Saved — leave blank to keep it",,active
+settings.provider_credentials.region_placeholder,ui,SettingsPage,ProviderCredentialsPanel,region_placeholder,"cn-beijing",,active
+settings.provider_credentials.save,ui,SettingsPage,ProviderCredentialsPanel,save,"Save",,active
+settings.provider_credentials.saving,ui,SettingsPage,ProviderCredentialsPanel,saving,"Saving…",,active
+settings.provider_credentials.remove,ui,SettingsPage,ProviderCredentialsPanel,remove,"Remove",,active
+settings.provider_credentials.saved,ui,SettingsPage,ProviderCredentialsPanel,saved,"Credentials saved locally.",,active
+settings.provider_credentials.removed,ui,SettingsPage,ProviderCredentialsPanel,removed,"Credentials removed.",,active
+settings.provider_credentials.save_failed,ui,SettingsPage,ProviderCredentialsPanel,save_failed,"Unable to save provider credentials",,active
+settings.provider_credentials.deepseek_required,ui,SettingsPage,ProviderCredentialsPanel,deepseek_required,"Enter a DeepSeek API key.",,active
+settings.provider_credentials.volcengine_required,ui,SettingsPage,ProviderCredentialsPanel,volcengine_required,"Enter both the AccessKey ID and Secret Access Key.",,active

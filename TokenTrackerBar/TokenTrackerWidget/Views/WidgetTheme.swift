@@ -39,6 +39,7 @@ enum WidgetTheme {
         case "grok":        return .primary
         case "antigravity": return .indigo
         case "copilot":     return .teal
+        case "volcengine":  return .cyan
         default:            return .gray
         }
     }

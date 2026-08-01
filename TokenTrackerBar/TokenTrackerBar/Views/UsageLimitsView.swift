@@ -76,9 +76,27 @@ struct UsageLimitsView: View {
             switch id {
             case "claude" where limits.claude.configured && limits.claude.error == nil:
                 groups.append(AnyView(toolSection(id: id, title: planTitle("Claude", limits.claude.planLabel), assetName: "ClaudeLogo", toolName: "Claude", specs: claudeSpecs(limits.claude), updatedAtISO: limits.claude.cachedAt, isStale: limits.claude.stale ?? false, retryAtISO: limits.claude.retryAt, serviceStatus: limits.claude.serviceStatus)))
-            case "codex" where limits.codex.configured && limits.codex.error == nil:
-                let resetState = codexResetBankViewData(limits.codex.resetCredits)
-                groups.append(AnyView(toolSection(id: id, title: planTitle("Codex", limits.codex.planLabel), assetName: "CodexLogo", toolName: "Codex", specs: codexSpecs(limits.codex), resetRows: resetState.rows, resetStatus: resetState.statusText, updatedAtISO: limits.codex.cachedAt, isStale: limits.codex.stale ?? false)))
+            case "codex" where limits.codex.configured:
+                let accounts = limits.codex.accounts.flatMap { $0.isEmpty ? nil : $0 } ?? [limits.codex]
+                for (index, account) in accounts.enumerated() {
+                    let accountID = account.accountID ?? "index-\(index)"
+                    let sectionID = "codex:\(accountID)"
+                    let title = planTitle("Codex", account.planLabel)
+                    let resetState = codexResetBankViewData(account.resetCredits)
+                    groups.append(AnyView(toolSection(
+                        id: sectionID,
+                        title: title,
+                        assetName: "CodexLogo",
+                        toolName: "Codex",
+                        specs: codexSpecs(account),
+                        resetRows: resetState.rows,
+                        resetStatus: resetState.statusText,
+                        titleSuffix: account.accountEmail.map { "· \($0)" },
+                        error: account.error,
+                        updatedAtISO: account.cachedAt,
+                        isStale: account.stale ?? false
+                    )))
+                }
             case "cursor" where limits.cursor.configured && limits.cursor.error == nil:
                 groups.append(AnyView(toolSection(id: id, title: planTitle("Cursor", limits.cursor.planLabel), assetName: "CursorLogo", toolName: "Cursor", specs: cursorSpecs(limits.cursor))))
             case "gemini" where limits.gemini.configured && limits.gemini.error == nil:
@@ -111,6 +129,14 @@ struct UsageLimitsView: View {
                 if let qoder = limits.qoder, qoder.configured, qoder.error == nil {
                     groups.append(AnyView(toolSection(id: id, title: planTitle("Qoder", qoder.planLabel), assetName: "QoderLogo", toolName: "Qoder", specs: qoderSpecs(qoder), updatedAtISO: qoder.cachedAt, isStale: qoder.stale ?? false)))
                 }
+            case "volcengine":
+                if let volcengine = limits.volcengine, volcengine.configured, volcengine.error == nil {
+                    groups.append(AnyView(toolSection(id: id, title: planTitle("Volcengine Ark", volcengine.planLabel), assetName: "VolcengineLogo", toolName: "Volcengine Ark", specs: volcengineSpecs(volcengine))))
+                }
+            case "deepseek":
+                if let deepseek = limits.deepseek, deepseek.configured, deepseek.error == nil {
+                    groups.append(AnyView(deepSeekBalanceSection(deepseek)))
+                }
             default:
                 break
             }
@@ -132,6 +158,7 @@ struct UsageLimitsView: View {
         /// "· Parallel: 20" concurrency cap). Renders caption2/tertiary so it
         /// reads as metadata, not part of the provider name.
         titleSuffix: String? = nil,
+        error: String? = nil,
         // Provider's own last-fetch stamp (Claude/Codex); nil falls back to the
         // response-level `fetched_at`, which is when every live provider was read.
         updatedAtISO: String? = nil,
@@ -164,12 +191,19 @@ struct UsageLimitsView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            VStack(spacing: 4) {
-                ForEach(specs) { spec in
-                    limitRow(label: spec.label, pct: spec.pct, reset: spec.resetText, toolName: toolName, windowSeconds: spec.windowSeconds, resetDate: spec.resetDate)
+            if let error {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(spacing: 4) {
+                    ForEach(specs) { spec in
+                        limitRow(label: spec.label, pct: spec.pct, reset: spec.resetText, toolName: toolName, windowSeconds: spec.windowSeconds, resetDate: spec.resetDate)
+                    }
                 }
             }
-            if !resetRows.isEmpty || resetStatus != nil {
+            if error == nil && (!resetRows.isEmpty || resetStatus != nil) {
                 resetSection(rows: resetRows, status: resetStatus)
             }
             if let serviceStatus {
@@ -177,12 +211,88 @@ struct UsageLimitsView: View {
             }
         }
         .modifier(ProviderClickableStyle(isActive: explainingProvider == id, isStale: isStale))
-        .onTapGesture { explainingProvider = (explainingProvider == id) ? nil : id }
+        .onTapGesture {
+            guard error == nil else { return }
+            explainingProvider = (explainingProvider == id) ? nil : id
+        }
         .popover(isPresented: isOpen, arrowEdge: .trailing) {
             // Keep on one line: codex-reset-bank guardrail tests assert this exact
             // call shape to prove reset-bank rows never leak into the explanation.
             LimitsExplainContent(providerName: title, specs: specs, remainingMode: settings.displayMode == .remaining, updatedAt: updatedAt, isStale: isStale, retryAt: retryAt)
         }
+    }
+
+    // MARK: - DeepSeek balance (real money values, no synthetic utilization)
+
+    private func deepSeekBalanceSection(_ data: DeepSeekLimits) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                brandIcon("DeepSeekLogo")
+                    .frame(width: 14, height: 14)
+                Text("DeepSeek")
+                    .font(.system(.caption, design: .default))
+                    .modifier(FontWeightModifier(weight: .medium))
+            }
+
+            if data.available == false {
+                Text(Strings.deepSeekBalanceUnavailable)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+
+            let balances = data.balances ?? []
+            if balances.isEmpty {
+                Text(Strings.noData)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(spacing: 4) {
+                    ForEach(Array(balances.enumerated()), id: \.offset) { _, balance in
+                        deepSeekBalanceRow(balance)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .padding(.horizontal, -6)
+    }
+
+    private func deepSeekBalanceRow(_ balance: DeepSeekBalance) -> some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            HStack(spacing: Self.rowColumnSpacing) {
+                Text(balance.currency.uppercased())
+                    .font(.system(.caption, design: .default))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(formatCurrencyAmount(balance.amount, currency: balance.currency))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .monospacedDigit()
+            }
+            if balance.grantedBalance != nil || balance.toppedUpBalance != nil {
+                Text(Strings.deepSeekBalanceDetail(
+                    granted: balance.grantedBalance.map { formatCurrencyAmount($0, currency: balance.currency) } ?? "—",
+                    toppedUp: balance.toppedUpBalance.map { formatCurrencyAmount($0, currency: balance.currency) } ?? "—"
+                ))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            }
+        }
+    }
+
+    private func formatCurrencyAmount(_ amount: Double, currency: String) -> String {
+        let code = currency.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = code.isEmpty ? "CNY" : code
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 4
+        if let value = formatter.string(from: NSNumber(value: amount)) {
+            return value
+        }
+        return "\(formatQuotaAmount(amount)) \(code.isEmpty ? "CNY" : code)"
     }
 
     // MARK: - Service status (status-page incident row)
@@ -222,14 +332,14 @@ struct UsageLimitsView: View {
 
     // MARK: - Window specs (one source of truth for rows + the explain popover)
 
-    private func makeSpec(_ label: String, _ pct: Double, windowSeconds: Double? = nil, iso: String?) -> LimitWindowSpec {
+    private func makeSpec(_ label: String, _ pct: Double, windowSeconds: Double? = nil, iso: String?, detail: String? = nil) -> LimitWindowSpec {
         let date = resetDate(iso: iso)
-        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString))
+        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString), detail: detail)
     }
 
     private func makeSpec(_ label: String, _ pct: Double, windowSeconds: Double? = nil, epoch: Int?) -> LimitWindowSpec {
         let date = resetDate(epoch: epoch)
-        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString))
+        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString), detail: nil)
     }
 
     private func claudeSpecs(_ c: ClaudeLimits) -> [LimitWindowSpec] {
@@ -358,6 +468,42 @@ struct UsageLimitsView: View {
             specs.append(makeSpec("Bonus", window.usedPercent, iso: window.resetAt))
         }
         return specs
+    }
+
+    private func volcengineSpecs(_ limits: VolcengineLimits) -> [LimitWindowSpec] {
+        var specs: [LimitWindowSpec] = []
+        if let window = limits.primaryWindow {
+            specs.append(makeSpec("5h", window.usedPercent, windowSeconds: 5 * 3600, iso: window.resetAt, detail: volcengineQuotaDetail(window)))
+        }
+        if let window = limits.secondaryWindow {
+            specs.append(makeSpec("Weekly", window.usedPercent, windowSeconds: 7 * 86400, iso: window.resetAt, detail: volcengineQuotaDetail(window)))
+        }
+        if let window = limits.tertiaryWindow {
+            specs.append(makeSpec("Monthly", window.usedPercent, iso: window.resetAt, detail: volcengineQuotaDetail(window)))
+        }
+        return specs
+    }
+
+    private func volcengineQuotaDetail(_ window: GenericLimitWindow) -> String? {
+        guard let used = window.usedCredits,
+              let limit = window.limitCredits,
+              let remaining = window.remainingCredits else {
+            return nil
+        }
+        return Strings.volcengineQuotaDetail(
+            used: formatQuotaAmount(used),
+            limit: formatQuotaAmount(limit),
+            remaining: formatQuotaAmount(remaining),
+            unit: window.unit ?? "AFP"
+        )
+    }
+
+    private func formatQuotaAmount(_ amount: Double) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 2
+        return formatter.string(from: NSNumber(value: amount)) ?? String(format: "%.2f", amount)
     }
 
     private func copilotSpecs(_ c: CopilotLimits) -> [LimitWindowSpec] {
@@ -570,7 +716,7 @@ struct UsageLimitsView: View {
     @ViewBuilder
     private func brandIcon(_ name: String) -> some View {
         switch name {
-        case "CursorLogo", "KimiLogo", "KiroLogo", "GrokLogo", "CopilotLogo", "ZcodeLogo", "OpenCodeLogo", "QoderLogo":
+        case "CursorLogo", "KimiLogo", "KiroLogo", "GrokLogo", "CopilotLogo", "ZcodeLogo", "OpenCodeLogo", "QoderLogo", "VolcengineLogo", "DeepSeekLogo":
             let filename: String = {
                 switch name {
                 case "CursorLogo": return "cursor.svg"
@@ -580,6 +726,8 @@ struct UsageLimitsView: View {
                 case "ZcodeLogo": return "zcode.svg"
                 case "OpenCodeLogo": return "opencode.svg"
                 case "QoderLogo": return "qoder.svg"
+                case "VolcengineLogo": return "volcengine.svg"
+                case "DeepSeekLogo": return "deepseek.svg"
                 default: return "copilot.svg"
                 }
             }()
@@ -806,6 +954,7 @@ private struct LimitWindowSpec: Identifiable {
     let windowSeconds: Double?
     let resetDate: Date?
     let resetText: String?
+    let detail: String?
 }
 
 /// Side popover with this provider's live per-window numbers (used %, even-pace %,
@@ -901,6 +1050,9 @@ private struct LimitsExplainContent: View {
         // relative countdown, so the popover carries the precise time.
         if let resetDate = spec.resetDate {
             text += " · " + Strings.limitResetsAt(resetDate)
+        }
+        if let detail = spec.detail {
+            text += " · " + detail
         }
         return text
     }

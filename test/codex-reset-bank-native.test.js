@@ -16,7 +16,8 @@ function readSource(relPath) {
 test("UsageLimitsView renders Codex Reset Bank as native rows, not the old footnote path", () => {
   const source = readSource("TokenTrackerBar/TokenTrackerBar/Views/UsageLimitsView.swift");
 
-  assert.match(source, /case "codex"[\s\S]*let resetState = codexResetBankViewData\(limits\.codex\.resetCredits\)/);
+  assert.match(source, /case "codex"[\s\S]*limits\.codex\.accounts[\s\S]*let resetState = codexResetBankViewData\(account\.resetCredits\)/);
+  assert.ok(source.includes(String.raw`let sectionID = "codex:\(accountID)"`));
   assert.match(source, /case "codex"[\s\S]*resetRows:\s*resetState\.rows/);
   assert.doesNotMatch(source, /footnote:\s*codexResetBankFootnote\(limits\.codex\.resetCredits\)/);
   assert.match(source, /private func resetSection\(/);

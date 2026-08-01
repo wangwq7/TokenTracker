@@ -5,6 +5,7 @@ import { LimitsSettingsPanel } from "../components/LimitsSettingsPanel.jsx";
 import { AccountSection } from "../components/settings/AccountSection.jsx";
 import { AppearanceSection } from "../components/settings/AppearanceSection.jsx";
 import { LabsSection } from "../components/settings/LabsSection.jsx";
+import { ProviderCredentialsPanel } from "../components/settings/ProviderCredentialsPanel.jsx";
 import {
   SectionCard,
   SegmentedControl,
@@ -16,6 +17,10 @@ import { LIMIT_DISPLAY_MODES, useLimitsDisplayPrefs } from "../hooks/use-limits-
 import { useNativeSettings } from "../hooks/use-native-settings.js";
 import { cn } from "../lib/cn";
 import { copy } from "../lib/copy";
+
+const IS_LOCAL_HOST =
+  typeof window !== "undefined" &&
+  (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 
 const SETTINGS_SECTION_IDS = {
   APPEARANCE: "appearance",
@@ -126,6 +131,14 @@ export function SettingsPage() {
           <SectionCard title={copy("settings.limits.providers")}>
             <LimitsSettingsPanel prefs={limitsPrefs} />
           </SectionCard>
+          {IS_LOCAL_HOST ? (
+            <SectionCard
+              title={copy("settings.provider_credentials.title")}
+              subtitle={copy("settings.provider_credentials.subtitle")}
+            >
+              <ProviderCredentialsPanel />
+            </SectionCard>
+          ) : null}
         </div>
       ),
     },

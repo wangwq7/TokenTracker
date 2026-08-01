@@ -392,6 +392,27 @@ enum WidgetSnapshotWriter {
             }
         }
 
+        // Volcengine Ark Agent Plan / Coding Plan
+        if let volcengine = limits.volcengine, volcengine.configured, volcengine.error == nil {
+            if let w = volcengine.primaryWindow {
+                out.append(LimitProvider(source: "volcengine", label: "Volcengine · 5h",
+                                         fraction: w.usedPercent / 100.0,
+                                         resetsAt: parseISO(w.resetAt)))
+            }
+            if let w = volcengine.secondaryWindow {
+                out.append(LimitProvider(source: "volcengine", label: "Volcengine · weekly",
+                                         fraction: w.usedPercent / 100.0,
+                                         resetsAt: parseISO(w.resetAt)))
+            }
+            if let w = volcengine.tertiaryWindow {
+                out.append(LimitProvider(source: "volcengine", label: "Volcengine · monthly",
+                                         fraction: w.usedPercent / 100.0,
+                                         resetsAt: parseISO(w.resetAt)))
+            }
+        }
+
+        // DeepSeek exposes account balances, not a quota fraction, so it is
+        // intentionally omitted from the progress-bar widget.
         return out.filter { !hiddenProviders.contains($0.source) }
     }
 

@@ -33,9 +33,12 @@ type CodexResetCredits = {
   readonly credits: readonly CodexResetCredit[];
 };
 
-type CodexUsageLimits = {
+type CodexAccountUsageLimits = {
   readonly configured: boolean;
   readonly error?: string | null;
+  readonly account_id?: string | null;
+  readonly account_email?: string | null;
+  readonly plan_type?: string | null;
   readonly plan_label?: string | null;
   readonly primary_window?: CodexLimitWindow | null;
   readonly secondary_window?: CodexLimitWindow | null;
@@ -43,6 +46,13 @@ type CodexUsageLimits = {
   readonly spark_primary_window?: CodexLimitWindow | null;
   readonly spark_secondary_window?: CodexLimitWindow | null;
   readonly reset_credits?: CodexResetCredits | null;
+  readonly auth_action_required?: string | null;
+  readonly stale?: boolean;
+  readonly cached_at?: string | null;
+};
+
+type CodexUsageLimits = CodexAccountUsageLimits & {
+  readonly accounts?: readonly CodexAccountUsageLimits[];
 };
 
 interface UsageLimitsData {

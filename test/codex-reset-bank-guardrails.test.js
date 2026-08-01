@@ -113,9 +113,11 @@ test("Codex reset bank native rows supersede the old macOS footnote path", () =>
     resetBankFixtureMicrosecondExpiry,
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/,
   );
-  assert.ok(usageLimitsView.includes('case "codex" where limits.codex.configured && limits.codex.error == nil'));
-  assert.ok(usageLimitsView.includes("let resetState = codexResetBankViewData(limits.codex.resetCredits)"));
-  assert.ok(usageLimitsView.includes("resetRows: resetState.rows, resetStatus: resetState.statusText"));
+  assert.ok(usageLimitsView.includes('case "codex" where limits.codex.configured'));
+  assert.ok(usageLimitsView.includes("limits.codex.accounts"));
+  assert.ok(usageLimitsView.includes(String.raw`let sectionID = "codex:\(accountID)"`));
+  assert.ok(usageLimitsView.includes("let resetState = codexResetBankViewData(account.resetCredits)"));
+  assert.match(usageLimitsView, /resetRows:\s*resetState\.rows,[\s\S]*?resetStatus:\s*resetState\.statusText/);
   assert.ok(usageLimitsView.includes("resetSection(rows: resetRows, status: resetStatus)"));
   assert.ok(usageLimitsView.includes("Text(Strings.codexResetBankSectionTitle)"));
   assert.ok(usageLimitsView.includes("ForEach(rows) { row in"));
@@ -158,24 +160,25 @@ test("Codex reset bank scope guard freezes widget menu bar and native bridge sur
     "Native Reset Bank rows must stay passive, with no consume/redeem action surface",
   );
 
-  const menuBarMetricEnum = menuBarDisplayPreferences.match(
-    /enum MenuBarDisplayMetric: String, CaseIterable \{[\s\S]*?\n\}\n\nprivate extension/,
-  );
-  assert.ok(menuBarMetricEnum, "MenuBarDisplayMetric enum should be present");
-  assertNoResetBankSurface(menuBarMetricEnum[0], "menu-bar metric enum");
+  const metricStart = menuBarDisplayPreferences.indexOf("enum MenuBarDisplayMetric: String, CaseIterable {");
+  const metricEnd = menuBarDisplayPreferences.indexOf("struct MenuBarSummarySelection", metricStart);
+  assert.ok(metricStart >= 0 && metricEnd > metricStart, "MenuBarDisplayMetric enum should be present");
+  const menuBarMetricEnum = menuBarDisplayPreferences.slice(metricStart, metricEnd);
+  assertNoResetBankSurface(menuBarMetricEnum, "menu-bar metric enum");
   assert.doesNotMatch(
     menuBarDisplayPreferences,
     /reset[-_ ]?(?:bank|credits?)[\s\S]{0,80}(?:account|profile|email|avatar|token|id)|(?:account|profile|email|avatar|token|id)[\s\S]{0,80}reset[-_ ]?(?:bank|credits?)/i,
     "Menu-bar display preferences must not learn Reset Bank identity fields",
   );
 
-  const limitProviders = widgetSnapshotWriter.match(
-    /private static func limitProviders\(from limits: UsageLimitsResponse\?\) -> \[LimitProvider\] \{[\s\S]*?return out\.filter \{ !hiddenProviders\.contains\(\$0\.source\) \}\n    \}/,
-  );
-  assert.ok(limitProviders, "WidgetSnapshotWriter.limitProviders should be present");
-  assert.match(limitProviders[0], /LimitProvider\(source: "codex", label: "Codex · 5h"/);
-  assert.match(limitProviders[0], /LimitProvider\(source: "codex", label: "Codex · Spark 7d"/);
-  assertNoResetBankSurface(limitProviders[0], "WidgetSnapshotWriter provider rows");
+  const providersStart = widgetSnapshotWriter.indexOf("private static func limitProviders(from limits: UsageLimitsResponse?) -> [LimitProvider] {");
+  const providersEnd = widgetSnapshotWriter.indexOf("private static let iso8601", providersStart);
+  assert.ok(providersStart >= 0 && providersEnd > providersStart, "WidgetSnapshotWriter.limitProviders should be present");
+  const limitProviders = widgetSnapshotWriter.slice(providersStart, providersEnd);
+  assert.match(limitProviders, /LimitProvider\(source: "codex", label: "Codex · 5h"/);
+  assert.match(limitProviders, /LimitProvider\(source: "codex", label: "Codex · Spark 7d"/);
+  assert.doesNotMatch(limitProviders, /\.codex\.accounts/, "Widget rows must keep using the top-level priority account");
+  assertNoResetBankSurface(limitProviders, "WidgetSnapshotWriter provider rows");
   assert.ok(usageLimitsWidget.includes("entry.snapshot.limits"));
   assert.ok(usageLimitsWidget.includes("ForEach(trimmed)"));
   assertNoResetBankSurface(usageLimitsWidget, "UsageLimitsWidget");

@@ -14,10 +14,12 @@ struct UsageLimitsResponse: Codable, Equatable {
     let zcode: ZcodeLimits?
     let opencodeGo: OpencodeGoLimits?
     let qoder: QoderLimits?
+    let volcengine: VolcengineLimits?
+    let deepseek: DeepSeekLimits?
 
     enum CodingKeys: String, CodingKey {
         case fetchedAt = "fetched_at"
-        case claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, qoder
+        case claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, qoder, volcengine, deepseek
         case opencodeGo = "opencodeGo"
     }
 }
@@ -211,6 +213,8 @@ struct ClaudeExtraUsage: Codable, Equatable {
 struct CodexLimits: Codable, Equatable {
     let configured: Bool
     let error: String?
+    let accountID: String?
+    let accountEmail: String?
     let planLabel: String?
     let primaryWindow: CodexWindow?
     let secondaryWindow: CodexWindow?
@@ -222,9 +226,12 @@ struct CodexLimits: Codable, Equatable {
     /// disk cache (`stale: true`) when the live wham read times out.
     let cachedAt: String?
     let stale: Bool?
+    let accounts: [CodexLimits]?
 
     enum CodingKeys: String, CodingKey {
-        case configured, error, stale
+        case configured, error, stale, accounts
+        case accountID = "account_id"
+        case accountEmail = "account_email"
         case planLabel = "plan_label"
         case primaryWindow = "primary_window"
         case secondaryWindow = "secondary_window"
@@ -311,10 +318,18 @@ struct CodexCreditWindow: Codable, Equatable {
 struct GenericLimitWindow: Codable, Equatable {
     let usedPercent: Double
     let resetAt: String?
+    let limitCredits: Double?
+    let usedCredits: Double?
+    let remainingCredits: Double?
+    let unit: String?
 
     enum CodingKeys: String, CodingKey {
         case usedPercent = "used_percent"
         case resetAt = "reset_at"
+        case limitCredits = "limit_credits"
+        case usedCredits = "used_credits"
+        case remainingCredits = "remaining_credits"
+        case unit
     }
 }
 
@@ -490,6 +505,43 @@ struct QoderLimits: Codable, Equatable {
     }
 }
 
+struct VolcengineLimits: Codable, Equatable {
+    let configured: Bool
+    let error: String?
+    let planLabel: String?
+    let primaryWindow: GenericLimitWindow?
+    let secondaryWindow: GenericLimitWindow?
+    let tertiaryWindow: GenericLimitWindow?
+
+    enum CodingKeys: String, CodingKey {
+        case configured, error
+        case planLabel = "plan_label"
+        case primaryWindow = "primary_window"
+        case secondaryWindow = "secondary_window"
+        case tertiaryWindow = "tertiary_window"
+    }
+}
+
+struct DeepSeekLimits: Codable, Equatable {
+    let configured: Bool
+    let error: String?
+    let available: Bool?
+    let balances: [DeepSeekBalance]?
+}
+
+struct DeepSeekBalance: Codable, Equatable {
+    let currency: String
+    let amount: Double
+    let grantedBalance: Double?
+    let toppedUpBalance: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case currency, amount
+        case grantedBalance = "granted_balance"
+        case toppedUpBalance = "topped_up_balance"
+    }
+}
+
 struct AntigravityLimits: Codable, Equatable {
     let configured: Bool
     let error: String?
@@ -519,9 +571,12 @@ struct AntigravityLimits: Codable, Equatable {
 /// previously successful snapshot with an all-error response).
 extension UsageLimitsResponse {
     var hasAnyProviderWithoutError: Bool {
+        let codexAccountUsable = codex.accounts?.contains { $0.configured && $0.error == nil }
+        let codexStatus: (Bool, String?) = codexAccountUsable.map { ($0, $0 ? nil : codex.error) }
+            ?? (codex.configured, codex.error)
         let providers: [(Bool, String?)] = [
             (claude.configured, claude.error),
-            (codex.configured, codex.error),
+            codexStatus,
             (cursor.configured, cursor.error),
             (gemini.configured, gemini.error),
             (kimi?.configured ?? false, kimi?.error),
@@ -532,6 +587,8 @@ extension UsageLimitsResponse {
             (zcode?.configured ?? false, zcode?.error),
             (opencodeGo?.configured ?? false, opencodeGo?.error),
             (qoder?.configured ?? false, qoder?.error),
+            (volcengine?.configured ?? false, volcengine?.error),
+            (deepseek?.configured ?? false, deepseek?.error),
         ]
         return providers.contains { $0.0 && $0.1 == nil }
     }

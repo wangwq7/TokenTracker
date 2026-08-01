@@ -73,6 +73,26 @@ function formatCreditAmount(
   }).format(n);
 }
 
+function formatCurrencyAmount(value, currency) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return null;
+  const code = typeof currency === "string" && currency.trim()
+    ? currency.trim().toUpperCase()
+    : "CNY";
+  try {
+    return new Intl.NumberFormat(getCopyLocale(), {
+      style: "currency",
+      currency: code,
+      currencyDisplay: "narrowSymbol",
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 4,
+    }).format(amount);
+  } catch (_error) {
+    const formatted = formatCreditAmount(amount, { maximumFractionDigits: 4 });
+    return formatted ? `${formatted} ${code}` : null;
+  }
+}
+
 function buildQuotaDetail(window) {
   if (!window || typeof window !== "object") return null;
   if (!(Number(window.limit_credits) > 0)) return null;
@@ -83,7 +103,9 @@ function buildQuotaDetail(window) {
   if (!used || !limit || !remaining) return null;
   const key = window.unit === "calls"
     ? "limits.qoder_calls.detail"
-    : "limits.codex_credits.detail";
+    : window.unit === "AFP"
+      ? "limits.volcengine_quota.detail"
+      : "limits.codex_credits.detail";
   return copy(key, { used, limit, remaining });
 }
 
@@ -372,6 +394,53 @@ function LimitWindowSection({ rows, mode, extra = null }) {
   );
 }
 
+function DeepSeekBalanceSection({ data }) {
+  const balances = Array.isArray(data?.balances) ? data.balances : [];
+  return (
+    <div className="flex flex-col gap-1.5" data-deepseek-balances="">
+      {data?.available === false ? (
+        <StatusLine tone="error">{copy("limits.deepseek.unavailable")}</StatusLine>
+      ) : null}
+      {balances.length === 0 ? <StatusLine>{copy("limits.status.no_data")}</StatusLine> : null}
+      {balances.map((balance, index) => {
+        const currency = typeof balance?.currency === "string" && balance.currency.trim()
+          ? balance.currency.trim().toUpperCase()
+          : "CNY";
+        const amount = formatCurrencyAmount(balance?.amount, currency);
+        const granted = formatCurrencyAmount(balance?.granted_balance, currency);
+        const toppedUp = formatCurrencyAmount(balance?.topped_up_balance, currency);
+        const detail = granted || toppedUp
+          ? copy("limits.deepseek.balance_detail", {
+              granted: granted || copy("shared.placeholder.short"),
+              toppedUp: toppedUp || copy("shared.placeholder.short"),
+            })
+          : null;
+        return (
+          <div key={`${currency}-${index}`} className="flex min-w-0 items-start gap-2" data-deepseek-balance-row="">
+            <span
+              data-limit-label=""
+              className="shrink-0 whitespace-nowrap text-[11px] text-oai-gray-500 dark:text-oai-gray-400"
+              style={{ width: "var(--tt-limits-label-w)" }}
+            >
+              {currency}
+            </span>
+            <div className="min-w-0 flex-1 text-right">
+              <div className="text-[12px] font-medium tabular-nums text-oai-gray-800 dark:text-oai-gray-100">
+                {amount || copy("shared.placeholder.short")}
+              </div>
+              {detail ? (
+                <div className="mt-0.5 text-[10px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
+                  {detail}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function resetBankHoverDetail(row) {
   if (!Number.isFinite(row.expiresMs)) return null;
   const days = Math.floor((row.expiresMs - Date.now()) / 86400000);
@@ -454,6 +523,9 @@ function renderProviderExtra(kind, data) {
   if (kind === "copilot_otel" && !data.otel_has_files && !data.otel_enabled) {
     return <CopilotOtelHint defaultDir={data.otel_default_dir} />;
   }
+  if (kind === "deepseek_balance") {
+    return <DeepSeekBalanceSection data={data} />;
+  }
   return null;
 }
 
@@ -474,11 +546,13 @@ function renderConfiguredProvider(id, data, title, mode, expanded, onToggle, bad
   );
 }
 
-function renderProviderGroup(id, data, mode, expanded, onToggle) {
+function renderProviderGroup(id, data, mode, expanded, onToggle, options = {}) {
   if (!PROVIDER_LIMIT_SPECS[id]) return null;
+  const groupKey = options.groupKey || id;
+  const titleOverride = options.title || null;
   if (!data?.configured) {
     return (
-      <ToolGroup key={id} name={limitProviderName(id)} providerId={id}>
+      <ToolGroup key={groupKey} name={titleOverride || limitProviderName(id)} providerId={id}>
         <StatusLine>{copy("limits.status.not_connected")}</StatusLine>
         {id === "opencodeGo" ? <OpenCodeGoSetupHint /> : null}
       </ToolGroup>
@@ -493,7 +567,7 @@ function renderProviderGroup(id, data, mode, expanded, onToggle) {
   }
   if (data.error) {
     return (
-      <ToolGroup key={id} name={limitProviderName(id)} providerId={id}>
+      <ToolGroup key={groupKey} name={titleOverride || limitProviderName(id)} providerId={id}>
         <StatusLine tone="error">{copy("shared.error.prefix", { error: data.error })}</StatusLine>
         {id === "kiro"
           ? renderProviderExtra(PROVIDER_LIMIT_SPECS.kiro.extra, data)
@@ -504,7 +578,7 @@ function renderProviderGroup(id, data, mode, expanded, onToggle) {
   }
 
   const baseName = limitProviderName(id);
-  const title = data.plan_label ? `${baseName} ${data.plan_label}` : baseName;
+  const title = titleOverride || (data.plan_label ? `${baseName} ${data.plan_label}` : baseName);
   let badge = null;
   if (id === "antigravity") {
     if (data.cached) {
@@ -552,7 +626,40 @@ function renderProviderGroup(id, data, mode, expanded, onToggle) {
       tooltip={copy("limits.provenance.tooltip", { source: provenance.source, confidence: provenance.confidence })}
     />;
   }
-  return renderConfiguredProvider(id, data, title, mode, expanded, onToggle, badge);
+  const rendered = renderConfiguredProvider(id, data, title, mode, expanded, onToggle, badge);
+  return rendered ? React.cloneElement(rendered, { key: groupKey }) : null;
+}
+
+function codexAccountTitle(account) {
+  const base = account?.plan_label ? `Codex ${account.plan_label}` : "Codex";
+  return account?.account_email ? `${base} · ${account.account_email}` : base;
+}
+
+function renderCodexGroups(data, mode, expandedId, setExpandedId) {
+  const accounts = Array.isArray(data?.accounts) && data.accounts.length > 0
+    ? data.accounts
+    : null;
+  if (!accounts) {
+    return [renderProviderGroup(
+      "codex",
+      data,
+      mode,
+      expandedId === "codex",
+      () => setExpandedId((prev) => (prev === "codex" ? null : "codex")),
+    )].filter(Boolean);
+  }
+  return accounts.map((account, index) => {
+    const accountId = account?.account_id || `index-${index}`;
+    const groupKey = `codex:${accountId}`;
+    return renderProviderGroup(
+      "codex",
+      account,
+      mode,
+      expandedId === groupKey,
+      () => setExpandedId((prev) => (prev === groupKey ? null : groupKey)),
+      { groupKey, title: codexAccountTitle(account) },
+    );
+  }).filter(Boolean);
 }
 
 function CopilotOtelHint({ defaultDir }) {
@@ -712,8 +819,8 @@ function useWidestLabelWidth(containerRef) {
   return labelWidth;
 }
 
-export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder, order, visibility, displayMode }) {
-  const dataById = { claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder };
+export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder, volcengine, deepseek, order, visibility, displayMode }) {
+  const dataById = { claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder, volcengine, deepseek };
   const containerRef = useRef(null);
   const labelWidth = useWidestLabelWidth(containerRef);
   const [expandedId, setExpandedId] = useState(null);
@@ -727,16 +834,18 @@ export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, gr
 
   const groups = effectiveOrder
     .filter((id) => !visibility || visibility[id] !== false)
-    .map((id) =>
-      renderProviderGroup(
+    .flatMap((id) => {
+      if (id === "codex") {
+        return renderCodexGroups(dataById.codex, effectiveMode, expandedId, setExpandedId);
+      }
+      return [renderProviderGroup(
         id,
         dataById[id],
         effectiveMode,
         expandedId === id,
         () => setExpandedId((prev) => (prev === id ? null : id)),
-      ),
-    )
-    .filter(Boolean);
+      )].filter(Boolean);
+    });
 
   return (
     <FadeIn delay={0.15}>

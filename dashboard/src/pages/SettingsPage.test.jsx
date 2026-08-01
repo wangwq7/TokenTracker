@@ -23,6 +23,8 @@ const LABELS = {
   "settings.section.limits": "Limits Display",
   "settings.section.labs": "Labs",
   "settings.limits.providers": "Providers",
+  "settings.provider_credentials.title": "Provider Credentials",
+  "settings.provider_credentials.subtitle": "Stored locally",
   "limits.settings.display_mode_label": "Usage Display",
   "settings.menubar.toastOnReset": "Toast on limits reset",
   "settings.menubar.toastOnResetHint": "Show a useful reset message",
@@ -74,6 +76,10 @@ vi.mock("../components/settings/LabsSection.jsx", () => ({
 
 vi.mock("../components/LimitsSettingsPanel.jsx", () => ({
   LimitsSettingsPanel: () => <div data-testid="limits-content" />,
+}));
+
+vi.mock("../components/settings/ProviderCredentialsPanel.jsx", () => ({
+  ProviderCredentialsPanel: () => <div data-testid="provider-credentials-content" />,
 }));
 
 vi.mock("../components/settings/Controls.jsx", () => ({
@@ -194,7 +200,7 @@ describe("SettingsPage category navigation", () => {
   it("groups display mode and reset feedback above the provider list", () => {
     renderSettings("/settings?section=limits");
 
-    const [settingsCard, providersCard] = screen.getAllByTestId("section-card");
+    const [settingsCard, providersCard, credentialsCard] = screen.getAllByTestId("section-card");
     expect(settingsCard.dataset.sectionCardTitle).toBe("Limits Display");
     expect(within(settingsCard).getByTestId("limits-mode")).toBeInTheDocument();
     expect(within(settingsCard).getByRole("switch", { name: "Toast on limits reset" })).toBeInTheDocument();
@@ -202,5 +208,7 @@ describe("SettingsPage category navigation", () => {
 
     expect(providersCard.dataset.sectionCardTitle).toBe("Providers");
     expect(within(providersCard).getByTestId("limits-content")).toBeInTheDocument();
+    expect(credentialsCard.dataset.sectionCardTitle).toBe("Provider Credentials");
+    expect(within(credentialsCard).getByTestId("provider-credentials-content")).toBeInTheDocument();
   });
 });
