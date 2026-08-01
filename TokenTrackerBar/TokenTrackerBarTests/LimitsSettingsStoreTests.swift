@@ -16,6 +16,8 @@ final class LimitsSettingsStoreTests: XCTestCase {
         )
         XCTAssertEqual(LimitsSettingsStore.displayNames["volcengine"], "Volcengine Ark")
         XCTAssertEqual(LimitsSettingsStore.displayNames["deepseek"], "DeepSeek")
+        XCTAssertEqual(LimitsSettingsStore.iconNames["volcengine"], "VolcengineLogo")
+        XCTAssertNil(LimitsSettingsStore.iconNames["deepseek"])
     }
 
     func testReorderMovingDownUsesOriginalDestinationOffset() {

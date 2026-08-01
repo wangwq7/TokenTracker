@@ -6,6 +6,16 @@ private struct MenuBarDisplayValue {
     let id: String
     let label: String
     let value: String
+    let iconName: String?
+
+    init(id: String, label: String, value: String) {
+        self.id = id
+        self.label = label
+        self.value = value
+        self.iconName = MenuBarDisplayMetric(rawValue: id)?
+            .providerKey
+            .flatMap { LimitsSettingsStore.iconNames[$0] }
+    }
 }
 
 @MainActor
@@ -659,8 +669,20 @@ final class StatusBarController: NSObject {
                 .font: labelFont,
                 .foregroundColor: labelColor,
             ])
-            let width = ceil(max(value.size().width, label.size().width))
-            return (value: value, label: label, width: width)
+            let icon = item.iconName.flatMap(NSImage.init(named:))
+            let iconSize: CGFloat = 8
+            let iconGap: CGFloat = icon == nil ? 0 : 2
+            let labelContentWidth = label.size().width + (icon == nil ? 0 : iconSize + iconGap)
+            let width = ceil(max(value.size().width, labelContentWidth))
+            return (
+                value: value,
+                label: label,
+                icon: icon,
+                iconSize: iconSize,
+                iconGap: iconGap,
+                labelContentWidth: labelContentWidth,
+                width: width
+            )
         }
 
         let trailingPadding: CGFloat = 3
@@ -695,7 +717,27 @@ final class StatusBarController: NSObject {
                 let valueRect = NSRect(x: cursorX, y: valueOriginY, width: column.width, height: valueHeight)
                 let labelRect = NSRect(x: cursorX, y: labelOriginY, width: column.width, height: labelHeight)
                 column.value.draw(in: self.centeredRect(for: column.value, in: valueRect))
-                column.label.draw(in: self.centeredRect(for: column.label, in: labelRect))
+                let labelContentX = labelRect.minX + floor((labelRect.width - column.labelContentWidth) / 2)
+                if let icon = column.icon {
+                    let iconRect = NSRect(
+                        x: labelContentX,
+                        y: floor(labelRect.midY - column.iconSize / 2),
+                        width: column.iconSize,
+                        height: column.iconSize
+                    )
+                    NSGraphicsContext.current?.imageInterpolation = .high
+                    icon.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1)
+                    NSGraphicsContext.current?.imageInterpolation = .default
+                }
+                let labelX = labelContentX + (column.icon == nil ? 0 : column.iconSize + column.iconGap)
+                column.label.draw(
+                    in: NSRect(
+                        x: labelX,
+                        y: labelRect.minY,
+                        width: ceil(column.label.size().width),
+                        height: labelRect.height
+                    )
+                )
                 cursorX += column.width
             }
             return true

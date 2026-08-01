@@ -65,4 +65,15 @@ test("macOS menu bar and Dynamic Island expose Volcengine windows but not DeepSe
   assert.match(island, /\.volcengine5h/);
   assert.match(island, /\.volcengineWeekly/);
   assert.match(island, /\.volcengineMonthly/);
+
+  const settingsStore = read("TokenTrackerBar/TokenTrackerBar/Models/LimitsSettingsStore.swift");
+  assert.match(settingsStore, /"volcengine": "VolcengineLogo"/);
+  assert.doesNotMatch(settingsStore, /"deepseek": "DeepSeekLogo"/);
+
+  assert.ok(
+    fs.existsSync(path.join(repoRoot, "TokenTrackerBar", "TokenTrackerBar", "Assets.xcassets", "VolcengineLogo.imageset", "volcengine.svg")),
+    "Volcengine native asset should be bundled",
+  );
+  assert.match(menuBar, /iconName = MenuBarDisplayMetric\(rawValue: id\)\?[\s\S]*LimitsSettingsStore\.iconNames/);
+  assert.match(menuBar, /icon\.draw\(in: iconRect/);
 });
