@@ -42,3 +42,27 @@ test("macOS widget and reset detector include only percentage-based Volcengine w
   assert.match(widget, /LimitProvider\(source: "volcengine", label: "Volcengine · monthly"/);
   assert.doesNotMatch(widget, /LimitProvider\(source: "deepseek"/);
 });
+
+test("macOS menu bar and Dynamic Island expose Volcengine windows but not DeepSeek balance", () => {
+  const preferences = read("TokenTrackerBar/TokenTrackerBar/Models/MenuBarDisplayPreferences.swift");
+  for (const metric of ["volcengine5h", "volcengineWeekly", "volcengineMonthly"]) {
+    assert.match(preferences, new RegExp(`case ${metric}`));
+  }
+  assert.match(preferences, /case \.volcengine5h, \.volcengineWeekly, \.volcengineMonthly: return "volcengine"/);
+  assert.doesNotMatch(preferences, /case deepseekBalance/);
+
+  const model = read("TokenTrackerBar/TokenTrackerBar/Models/UsageLimits.swift");
+  assert.match(model, /case \.volcengine5h:[\s\S]*volcengine\?\.primaryWindow\?\.usedPercent/);
+  assert.match(model, /case \.volcengineWeekly:[\s\S]*volcengine\?\.secondaryWindow\?\.usedPercent/);
+  assert.match(model, /case \.volcengineMonthly:[\s\S]*volcengine\?\.tertiaryWindow\?\.usedPercent/);
+
+  const menuBar = read("TokenTrackerBar/TokenTrackerBar/Services/StatusBarController.swift");
+  assert.match(menuBar, /case \.volcengine5h:[\s\S]*volcengine\?\.primaryWindow/);
+  assert.match(menuBar, /case \.volcengineWeekly:[\s\S]*volcengine\?\.secondaryWindow/);
+  assert.match(menuBar, /case \.volcengineMonthly:[\s\S]*volcengine\?\.tertiaryWindow/);
+
+  const island = read("TokenTrackerBar/TokenTrackerBar/Views/DynamicIslandView.swift");
+  assert.match(island, /\.volcengine5h/);
+  assert.match(island, /\.volcengineWeekly/);
+  assert.match(island, /\.volcengineMonthly/);
+});

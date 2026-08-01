@@ -261,10 +261,12 @@ struct DynamicIslandView: View {
         case .totalCost:
             let val = viewModel.totalSummary == nil ? "--" : viewModel.totalCost
             return (nil, "All", val)
-        case .claude5h, .codex5h, .codexSpark5h, .kimi5h, .antigravityClaude5h, .antigravityGemini5h:
+        case .claude5h, .codex5h, .codexSpark5h, .kimi5h, .antigravityClaude5h, .antigravityGemini5h, .volcengine5h:
             return (nil, "5h", limitPercentText(for: metric) ?? "--")
-        case .claude7d, .codex7d, .codexSpark7d, .antigravityClaudeWeekly, .antigravityGeminiWeekly:
+        case .claude7d, .codex7d, .codexSpark7d, .antigravityClaudeWeekly, .antigravityGeminiWeekly, .volcengineWeekly:
             return (nil, "7d", limitPercentText(for: metric) ?? "--")
+        case .volcengineMonthly:
+            return (nil, "Mo", limitPercentText(for: metric) ?? "--")
         case .cursorPlan:
             return (nil, "Plan", limitPercentText(for: metric) ?? "--")
         case .cursorAuto:

@@ -34,6 +34,9 @@ export const FALLBACK_MENU_BAR_ITEMS = [
   { id: "antigravityClaude5h", label: "Antigravity Claude 5h Limit", shortLabel: "Ag Cl 5h", category: "limits" },
   { id: "antigravityGeminiWeekly", label: "Antigravity Gemini 7d Limit", shortLabel: "Ag Gm 7d", category: "limits" },
   { id: "antigravityGemini5h", label: "Antigravity Gemini 5h Limit", shortLabel: "Ag Gm 5h", category: "limits" },
+  { id: "volcengine5h", label: "Volcengine Ark 5h Limit", shortLabel: "Ark 5h", category: "limits" },
+  { id: "volcengineWeekly", label: "Volcengine Ark Weekly Limit", shortLabel: "Ark Wk", category: "limits" },
+  { id: "volcengineMonthly", label: "Volcengine Ark Monthly Limit", shortLabel: "Ark Mo", category: "limits" },
 ];
 
 export function normalizeMenuBarItems(ids, availableItems = FALLBACK_MENU_BAR_ITEMS, maxItems = 2) {

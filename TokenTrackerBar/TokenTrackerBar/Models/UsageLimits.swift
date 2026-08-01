@@ -98,6 +98,12 @@ extension UsageLimitsResponse {
             return guarded(qoder?.configured, qoder?.error, qoder?.primaryWindow?.usedPercent)
         case .qoderUltimate:
             return guarded(qoder?.configured, qoder?.error, qoder?.secondaryWindow?.usedPercent)
+        case .volcengine5h:
+            return guarded(volcengine?.configured, volcengine?.error, volcengine?.primaryWindow?.usedPercent)
+        case .volcengineWeekly:
+            return guarded(volcengine?.configured, volcengine?.error, volcengine?.secondaryWindow?.usedPercent)
+        case .volcengineMonthly:
+            return guarded(volcengine?.configured, volcengine?.error, volcengine?.tertiaryWindow?.usedPercent)
         }
     }
 }

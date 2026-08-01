@@ -524,6 +524,12 @@ final class StatusBarController: NSObject {
                 return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.qoder?.configured, error: viewModel.usageLimits?.qoder?.error, window: viewModel.usageLimits?.qoder?.primaryWindow)
             case .qoderUltimate:
                 return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.qoder?.configured, error: viewModel.usageLimits?.qoder?.error, window: viewModel.usageLimits?.qoder?.secondaryWindow)
+            case .volcengine5h:
+                return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.volcengine?.configured, error: viewModel.usageLimits?.volcengine?.error, window: viewModel.usageLimits?.volcengine?.primaryWindow)
+            case .volcengineWeekly:
+                return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.volcengine?.configured, error: viewModel.usageLimits?.volcengine?.error, window: viewModel.usageLimits?.volcengine?.secondaryWindow)
+            case .volcengineMonthly:
+                return genericLimitValue(id: id, metric: metric, configured: viewModel.usageLimits?.volcengine?.configured, error: viewModel.usageLimits?.volcengine?.error, window: viewModel.usageLimits?.volcengine?.tertiaryWindow)
             }
         }
     }

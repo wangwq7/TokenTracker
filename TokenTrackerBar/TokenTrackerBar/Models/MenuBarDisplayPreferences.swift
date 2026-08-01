@@ -36,6 +36,9 @@ enum MenuBarDisplayMetric: String, CaseIterable {
     case zcodeGlm5Turbo
     case qoderQuota
     case qoderUltimate
+    case volcengine5h
+    case volcengineWeekly
+    case volcengineMonthly
 
     var menuLabel: String {
         switch self {
@@ -76,6 +79,9 @@ enum MenuBarDisplayMetric: String, CaseIterable {
         case .zcodeGlm5Turbo: return "ZC Sec"
         case .qoderQuota: return "Qd Cred"
         case .qoderUltimate: return "Qd Ult"
+        case .volcengine5h: return "Ark 5h"
+        case .volcengineWeekly: return "Ark Wk"
+        case .volcengineMonthly: return "Ark Mo"
         }
     }
 
@@ -116,6 +122,9 @@ enum MenuBarDisplayMetric: String, CaseIterable {
         case .zcodeGlm5Turbo: return "ZCode Secondary Limit"
         case .qoderQuota: return "Qoder Credits Limit"
         case .qoderUltimate: return "Qoder Ultimate Free Calls"
+        case .volcengine5h: return "Volcengine Ark 5h Limit"
+        case .volcengineWeekly: return "Volcengine Ark Weekly Limit"
+        case .volcengineMonthly: return "Volcengine Ark Monthly Limit"
         }
     }
 
@@ -134,7 +143,8 @@ enum MenuBarDisplayMetric: String, CaseIterable {
              .copilotPremium, .copilotChat,
              .antigravityClaudeWeekly, .antigravityClaude5h, .antigravityGeminiWeekly, .antigravityGemini5h,
              .zcodeGlm52, .zcodeGlm5Turbo,
-             .qoderQuota, .qoderUltimate:
+             .qoderQuota, .qoderUltimate,
+             .volcengine5h, .volcengineWeekly, .volcengineMonthly:
             return "limits"
         }
     }
@@ -157,6 +167,7 @@ enum MenuBarDisplayMetric: String, CaseIterable {
         case .antigravityClaudeWeekly, .antigravityClaude5h, .antigravityGeminiWeekly, .antigravityGemini5h: return "antigravity"
         case .zcodeGlm52, .zcodeGlm5Turbo: return "zcode"
         case .qoderQuota, .qoderUltimate: return "qoder"
+        case .volcengine5h, .volcengineWeekly, .volcengineMonthly: return "volcengine"
         }
     }
 }
@@ -186,6 +197,7 @@ private extension UsageLimitsResponse {
         case "antigravity": return antigravity.configured && antigravity.error == nil
         case "zcode": return (zcode?.configured == true) && (zcode?.error == nil)
         case "qoder": return (qoder?.configured == true) && (qoder?.error == nil)
+        case "volcengine": return (volcengine?.configured == true) && (volcengine?.error == nil)
         default: return false
         }
     }
@@ -224,6 +236,9 @@ private extension UsageLimitsResponse {
         case .zcodeGlm5Turbo: return zcode?.secondaryWindow != nil
         case .qoderQuota: return qoder?.primaryWindow != nil
         case .qoderUltimate: return qoder?.secondaryWindow != nil
+        case .volcengine5h: return volcengine?.primaryWindow != nil
+        case .volcengineWeekly: return volcengine?.secondaryWindow != nil
+        case .volcengineMonthly: return volcengine?.tertiaryWindow != nil
         }
     }
 }
@@ -331,7 +346,8 @@ enum MenuBarDisplayPreferences {
                  .antigravityClaudeWeekly, .antigravityClaude5h,
                  .antigravityGeminiWeekly, .antigravityGemini5h,
                  .zcodeGlm52, .zcodeGlm5Turbo,
-                 .qoderQuota, .qoderUltimate:
+                 .qoderQuota, .qoderUltimate,
+                 .volcengine5h, .volcengineWeekly, .volcengineMonthly:
                 break
             }
         }

@@ -153,6 +153,31 @@ final class MenuBarDisplayPreferencesTests: XCTestCase {
         XCTAssertFalse(ids.contains(MenuBarDisplayMetric.codex7d.rawValue))
     }
 
+    func testVolcengineMetricsAppearForAvailableWindows() throws {
+        let limits = try decodeResponse(overrides: [
+            "volcengine": [
+                "configured": true,
+                "primary_window": ["used_percent": 10],
+                "secondary_window": ["used_percent": 20],
+                "tertiary_window": ["used_percent": 30],
+            ],
+        ])
+
+        let ids = MenuBarDisplayPreferences.availableItemIDs(for: limits)
+
+        XCTAssertTrue(ids.contains(MenuBarDisplayMetric.volcengine5h.rawValue))
+        XCTAssertTrue(ids.contains(MenuBarDisplayMetric.volcengineWeekly.rawValue))
+        XCTAssertTrue(ids.contains(MenuBarDisplayMetric.volcengineMonthly.rawValue))
+    }
+
+    func testDeepSeekBalanceDoesNotBecomeMenuBarMetric() {
+        XCTAssertFalse(
+            MenuBarDisplayMetric.allCases.contains {
+                $0.providerKey == "deepseek"
+            }
+        )
+    }
+
     /// Every limit metric's providerKey must be a known LimitsSettingsStore
     /// provider id, or visibility filtering silently never matches it.
     func testProviderKeysMatchLimitsSettingsStoreProviders() {

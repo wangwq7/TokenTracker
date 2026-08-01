@@ -26,6 +26,13 @@ describe("normalizeMenuBarItems", () => {
     ]);
   });
 
+  it("keeps Volcengine selections when the native bridge has not provided items", () => {
+    expect(normalizeMenuBarItems(["volcengine5h", "volcengineMonthly"])).toEqual([
+      "volcengine5h",
+      "volcengineMonthly",
+    ]);
+  });
+
   it("caps selections to the native menu bar width limit", () => {
     const ids = FALLBACK_MENU_BAR_ITEMS.map((item) => item.id);
     expect(normalizeMenuBarItems(ids, FALLBACK_MENU_BAR_ITEMS, 3)).toEqual(ids.slice(0, 3));
