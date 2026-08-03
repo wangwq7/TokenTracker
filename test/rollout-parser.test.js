@@ -9100,6 +9100,53 @@ test("resolvePiSessionFiles returns empty when ~/.pi/agent/sessions missing", as
   assert.deepEqual(result, []);
 });
 
+test("resolvePiSessionFiles discovers flat Cindy pi-agent-home sessions", async () => {
+  const cindyDir = await fs.mkdtemp(path.join(os.tmpdir(), "tt-cindy-pi-"));
+  try {
+    const sessionsDir = path.join(cindyDir, "pi-agent-home", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const filePath = path.join(sessionsDir, "session.jsonl");
+    await fs.writeFile(filePath, buildOmpSessionHeader() + "\n", "utf8");
+
+    const result = resolvePiSessionFiles({
+      HOME: path.join(cindyDir, "home"),
+      TOKENTRACKER_CINDY_DATA_DIR: cindyDir,
+      TOKENTRACKER_WSL_MODE: "native-only",
+    });
+    assert.deepEqual(result, [fssync.realpathSync(filePath)]);
+  } finally {
+    await fs.rm(cindyDir, { recursive: true, force: true });
+  }
+});
+
+test("Cindy pi override does not hide the system pi install", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "tt-cindy-pi-union-"));
+  try {
+    const systemSessions = path.join(root, "home", ".pi", "agent", "sessions", "--system--");
+    const cindyHome = path.join(root, "Cindy", "pi-agent-home");
+    const cindySessions = path.join(cindyHome, "sessions");
+    await fs.mkdir(systemSessions, { recursive: true });
+    await fs.mkdir(cindySessions, { recursive: true });
+    const systemFile = path.join(systemSessions, "system.jsonl");
+    const cindyFile = path.join(cindySessions, "cindy.jsonl");
+    await fs.writeFile(systemFile, buildOmpSessionHeader() + "\n", "utf8");
+    await fs.writeFile(cindyFile, buildOmpSessionHeader() + "\n", "utf8");
+
+    const result = resolvePiSessionFiles({
+      HOME: path.join(root, "home"),
+      TOKENTRACKER_CINDY_DATA_DIR: path.join(root, "Cindy"),
+      TOKENTRACKER_PI_AGENT_DIR: cindyHome,
+      TOKENTRACKER_WSL_MODE: "native-only",
+    });
+    assert.deepEqual(result, [
+      fssync.realpathSync(cindyFile),
+      fssync.realpathSync(systemFile),
+    ].sort((a, b) => a.localeCompare(b)));
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 // PI_CODING_AGENT_DIR is documented by both pi-coding-agent and oh-my-pi.
 // Routing is decided by the install-signal disambiguator: ~/.pi present → pi,
 // otherwise omp (back-compat).

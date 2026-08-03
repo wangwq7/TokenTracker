@@ -48,8 +48,8 @@ async function writeArchivedCodexRollout(codexHome, date, uuid, totalTokens) {
   return filePath;
 }
 
-async function writeClaudeSession(home, date, sessionId, totalTokens) {
-  const dir = path.join(home, ".claude", "projects", "sample");
+async function writeClaudeSessionToHome(claudeHome, date, sessionId, totalTokens) {
+  const dir = path.join(claudeHome, "projects", "sample");
   await fs.mkdir(dir, { recursive: true });
   const filePath = path.join(dir, `${sessionId}.jsonl`);
   await fs.writeFile(
@@ -74,6 +74,10 @@ async function writeClaudeSession(home, date, sessionId, totalTokens) {
   return filePath;
 }
 
+async function writeClaudeSession(home, date, sessionId, totalTokens) {
+  return writeClaudeSessionToHome(path.join(home, ".claude"), date, sessionId, totalTokens);
+}
+
 async function withTempSyncEnv(fn) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-background-"));
   const saved = {
@@ -81,6 +85,7 @@ async function withTempSyncEnv(fn) {
     USERPROFILE: process.env.USERPROFILE,
     CODEX_HOME: process.env.CODEX_HOME,
     CODE_HOME: process.env.CODE_HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
     GEMINI_HOME: process.env.GEMINI_HOME,
     OPENCODE_HOME: process.env.OPENCODE_HOME,
     XDG_DATA_HOME: process.env.XDG_DATA_HOME,
@@ -90,6 +95,7 @@ async function withTempSyncEnv(fn) {
     TOKENTRACKER_OPENCLAW_AGENT_ID: process.env.TOKENTRACKER_OPENCLAW_AGENT_ID,
     TOKENTRACKER_OPENCLAW_PREV_SESSION_ID: process.env.TOKENTRACKER_OPENCLAW_PREV_SESSION_ID,
     TOKENTRACKER_OPENCLAW_SESSION_KEY: process.env.TOKENTRACKER_OPENCLAW_SESSION_KEY,
+    TOKENTRACKER_CINDY_DATA_DIR: process.env.TOKENTRACKER_CINDY_DATA_DIR,
   };
   try {
     process.env.HOME = home;
@@ -105,6 +111,8 @@ async function withTempSyncEnv(fn) {
     delete process.env.TOKENTRACKER_OPENCLAW_AGENT_ID;
     delete process.env.TOKENTRACKER_OPENCLAW_PREV_SESSION_ID;
     delete process.env.TOKENTRACKER_OPENCLAW_SESSION_KEY;
+    delete process.env.TOKENTRACKER_CINDY_DATA_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
     return await fn(home);
   } finally {
     for (const [key, value] of Object.entries(saved)) {
@@ -155,6 +163,38 @@ test("background auto sync skips deep Codex archives", async () => {
     assert.match(queue, /"source":"codex"/);
     assert.match(queue, /"total_tokens":31/);
     assert.doesNotMatch(queue, /"total_tokens":47/);
+  });
+});
+
+test("Cindy CODEX_HOME is unioned with the system Codex home", async () => {
+  await withTempSyncEnv(async (home) => {
+    const cindyDataDir = path.join(home, "AppData", "Roaming", "Cindy");
+    const cindyCodexHome = path.join(cindyDataDir, "codex-home");
+    const systemCodexHome = path.join(home, ".codex");
+    process.env.TOKENTRACKER_CINDY_DATA_DIR = cindyDataDir;
+    process.env.CODEX_HOME = cindyCodexHome;
+    await writeCodexRollout(
+      cindyCodexHome,
+      "2026-06-30",
+      "019f16bd-1100-7000-8000-aaaaaaaaaaaa",
+      41,
+    );
+    await writeCodexRollout(
+      systemCodexHome,
+      "2026-06-30",
+      "019f16bd-1101-7000-8000-aaaaaaaaaaaa",
+      43,
+    );
+
+    await cmdSync(["--auto", "--background"]);
+
+    const rows = (await readQueue(home))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].source, "codex");
+    assert.equal(rows[0].total_tokens, 84);
   });
 });
 
@@ -339,6 +379,37 @@ test("all-local background sync includes Claude while preserving lightweight beh
       fs.stat(path.join(home, ".tokentracker", "tracker", "queue.state.json")),
       { code: "ENOENT" },
     );
+  });
+});
+
+test("Cindy CLAUDE_CONFIG_DIR is unioned with the system Claude home", async () => {
+  await withTempSyncEnv(async (home) => {
+    const cindyDataDir = path.join(home, "AppData", "Roaming", "Cindy");
+    const cindyClaudeHome = path.join(cindyDataDir, "claude-home");
+    process.env.TOKENTRACKER_CINDY_DATA_DIR = cindyDataDir;
+    process.env.CLAUDE_CONFIG_DIR = cindyClaudeHome;
+    await writeClaudeSessionToHome(
+      path.join(home, ".claude"),
+      "2026-06-30",
+      "session-system-claude",
+      53,
+    );
+    await writeClaudeSessionToHome(
+      cindyClaudeHome,
+      "2026-06-30",
+      "session-cindy-claude",
+      59,
+    );
+
+    await cmdSync(["--auto", "--background", "--all-local-sources"]);
+
+    const rows = (await readQueue(home))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].source, "claude");
+    assert.equal(rows[0].total_tokens, 112);
   });
 });
 

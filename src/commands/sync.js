@@ -7,6 +7,7 @@ const readline = require("node:readline");
 
 const { resolveInstallPaths, ensureFlatCursor } = require("../lib/install-resolver");
 const { multiInstallParse, mergeBothFileSources } = require("../lib/multi-install-parser");
+const { resolveCindyAgentHomes, pathIdentity } = require("../lib/cindy-paths");
 const wsl = require("../lib/wsl-probe");
 const {
   ensureDir,
@@ -75,7 +76,6 @@ const {
   parseOmpIncremental,
   resolvePiSessionFiles,
   parsePiIncremental,
-  piAgentDirCollidesWithOmp,
   resolveCraftSessionFiles,
   parseCraftIncremental,
   resolveGrokBuildSessions,
@@ -517,16 +517,34 @@ async function cmdSync(argv, context = {}) {
     // which would then erase the native history. The file-hash and
     // message-hash dedup layers make the union safe. Native is listed first
     // so the cross-environment file dedup keeps the native copy as primary.
-    const claudeNativeHome = path.join(home, ".claude");
     const wslClaudeHome = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
       ? wsl.discoverWslHome(".claude")
       : null;
     const claudeInstallHomes = [];
     if (process.platform !== "win32" || wsl.shouldProbeNative(process.env)) {
-      claudeInstallHomes.push(claudeNativeHome);
+      const cindyClaudeHomes = resolveCindyAgentHomes("claude", { env: process.env, home });
+      const cindyClaudeKeys = new Set(cindyClaudeHomes.map((dir) => pathIdentity(dir)));
+      const configuredClaudeIsCindy = Boolean(
+        process.env.CLAUDE_CONFIG_DIR
+        && cindyClaudeKeys.has(pathIdentity(process.env.CLAUDE_CONFIG_DIR)),
+      );
+      if (!process.env.CLAUDE_CONFIG_DIR || configuredClaudeIsCindy) {
+        claudeInstallHomes.push(path.join(home, ".claude"));
+      }
+      claudeInstallHomes.push(...cindyClaudeHomes);
+      if (process.env.CLAUDE_CONFIG_DIR) {
+        claudeInstallHomes.push(process.env.CLAUDE_CONFIG_DIR);
+      }
     }
     if (wslClaudeHome) claudeInstallHomes.push(wslClaudeHome);
-    const claudeProjectsDirs = claudeInstallHomes.map((h) => path.join(h, "projects"));
+    const seenClaudeHomes = new Set();
+    const claudeProjectsDirs = [];
+    for (const claudeHome of claudeInstallHomes) {
+      const key = pathIdentity(claudeHome);
+      if (seenClaudeHomes.has(key)) continue;
+      seenClaudeHomes.add(key);
+      claudeProjectsDirs.push(path.join(claudeHome, "projects"));
+    }
     const xdgDataHome = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
     const kiloHome = process.env.KILO_HOME || path.join(xdgDataHome, "kilo");
     const mimoHome = process.env.MIMO_HOME || path.join(xdgDataHome, "mimocode");
@@ -586,10 +604,23 @@ async function cmdSync(argv, context = {}) {
     const sources = [];
     if (sourceAllowed("codex")) {
       const codexNativeValue = process.env.CODEX_HOME || path.join(home, ".codex");
+      const cindyCodexHomes = process.platform !== "win32" || wsl.shouldProbeNative(process.env)
+        ? resolveCindyAgentHomes("codex", { env: process.env, home })
+        : [];
+      const cindyCodexKeys = new Set(cindyCodexHomes.map((dir) => pathIdentity(dir)));
+      const configuredCodexIsCindy = Boolean(
+        process.env.CODEX_HOME && cindyCodexKeys.has(pathIdentity(process.env.CODEX_HOME)),
+      );
       const wslCodexDir = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
         ? wsl.discoverWslHome(".codex")
         : null;
       const codexPaths = resolveInstallPaths({ nativeValue: codexNativeValue, wslValue: wslCodexDir });
+      if (configuredCodexIsCindy) {
+        sources.push({ source: "codex", sessionsDir: path.join(home, ".codex", "sessions"), codexInventoryCache: true });
+        if (!isBackgroundLightweightSync || backgroundCodexUsageRepair) {
+          sources.push({ source: "codex", sessionsDir: path.join(home, ".codex", "archived_sessions"), deep: true });
+        }
+      }
       if (codexPaths.native) {
         sources.push({ source: "codex", sessionsDir: path.join(codexPaths.native, "sessions"), codexInventoryCache: true });
         if (!isBackgroundLightweightSync || backgroundCodexUsageRepair) {
@@ -600,6 +631,14 @@ async function cmdSync(argv, context = {}) {
         sources.push({ source: "codex", sessionsDir: path.join(codexPaths.wsl, "sessions"), codexInventoryCache: true });
         if (!isBackgroundLightweightSync || backgroundCodexUsageRepair) {
           sources.push({ source: "codex", sessionsDir: path.join(codexPaths.wsl, "archived_sessions"), deep: true });
+        }
+      }
+      if (process.platform !== "win32" || wsl.shouldProbeNative(process.env)) {
+        for (const cindyCodexHome of cindyCodexHomes) {
+          sources.push({ source: "codex", sessionsDir: path.join(cindyCodexHome, "sessions"), codexInventoryCache: true });
+          if (!isBackgroundLightweightSync || backgroundCodexUsageRepair) {
+            sources.push({ source: "codex", sessionsDir: path.join(cindyCodexHome, "archived_sessions"), deep: true });
+          }
         }
       }
     }
@@ -625,8 +664,9 @@ async function cmdSync(argv, context = {}) {
         : { version: 1, days: {} };
     if (sourceAllowed("codex")) cursors.codexDayInventoryCache = codexDayInventoryCache;
     for (const entry of sources) {
-      if (seenSessions.has(entry.sessionsDir)) continue;
-      seenSessions.add(entry.sessionsDir);
+      const sessionsKey = pathIdentity(entry.sessionsDir);
+      if (seenSessions.has(sessionsKey)) continue;
+      seenSessions.add(sessionsKey);
       const files = entry.deep
         ? await listRolloutFilesDeep(entry.sessionsDir)
         : await listRolloutFiles(entry.sessionsDir, entry.codexInventoryCache
@@ -1863,14 +1903,14 @@ async function cmdSync(argv, context = {}) {
       }
     }
 
-    // ── pi (@mariozechner/pi-coding-agent) — passive ~/.pi/agent/sessions/**/*.jsonl reader ──
+    // ── pi (@mariozechner/pi-coding-agent) — passive system + Cindy sessions reader ──
     // Skip pi parse if its agent dir resolves to the same path as omp's. This
     // prevents double-counting when explicit overrides (TOKENTRACKER_OMP_AGENT_DIR /
     // TOKENTRACKER_PI_AGENT_DIR) bypass the install-signal disambiguator.
     let piResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
-    const piFiles = !sourceAllowed("pi") || piAgentDirCollidesWithOmp(process.env)
-      ? []
-      : mergeBothFileSources({ resolveFiles: resolvePiSessionFiles, env: process.env });
+    const piFiles = sourceAllowed("pi")
+      ? mergeBothFileSources({ resolveFiles: resolvePiSessionFiles, env: process.env })
+      : [];
     if (piFiles.length > 0) {
       if (progress?.enabled) {
         progress.start(`Parsing pi ${renderBar(0)} | buckets 0`);

@@ -63,8 +63,7 @@ const {
 const { resolveTrackerPaths } = require("../lib/tracker-paths");
 const {
   resolveOmpAgentDir,
-  resolvePiAgentDir,
-  piAgentDirCollidesWithOmp,
+  resolvePiAgentDirs,
   resolveAnythingllmDbPath,
 } = require("../lib/rollout");
 const { resolveRuntimeConfig, DEFAULT_BASE_URL } = require("../lib/runtime-config");
@@ -695,15 +694,11 @@ async function applyIntegrationSetup({
   }
 
   // pi (@mariozechner/pi-coding-agent): passive reader — no hook installation needed.
-  // TokenTracker reads ~/.pi/agent/sessions/**/*.jsonl directly. Skip when its
-  // agent dir collides with omp's so the summary matches what sync will scan.
-  if (!piAgentDirCollidesWithOmp(process.env)) {
-    // Same win32 nullability as oh-my-pi above: resolvePiAgentDir is null when
-    // ~/.pi doesn't exist, so guard before joining.
-    const piAgentDir = resolvePiAgentDir(process.env);
-    if (piAgentDir && fssync.existsSync(path.join(piAgentDir, "sessions"))) {
-      summary.push({ label: "pi", status: "detected", detail: "Passive reader (no hook needed)" });
-    }
+  // TokenTracker reads both the system pi home and Cindy's isolated
+  // pi-agent-home. The resolver excludes any directory owned by oh-my-pi.
+  const piAgentDirs = resolvePiAgentDirs(process.env);
+  if (piAgentDirs.some((dir) => fssync.existsSync(path.join(dir, "sessions")))) {
+    summary.push({ label: "pi", status: "detected", detail: "Passive reader (no hook needed)" });
   }
 
   // Craft Agents: passive reader — no hook installation needed.

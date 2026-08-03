@@ -10,6 +10,7 @@ const { physicalJsonlRecords } = require("./jsonl-lines");
 const { readSqliteJsonRows, readSqliteJsonRowsAsync } = require("./sqlite-reader");
 const wsl = require("./wsl-probe");
 const { resolveInstallPaths } = require("./install-resolver");
+const { resolveCindyAgentHomes, pathIdentity } = require("./cindy-paths");
 const {
   consumeUsageDelta,
   createUsageDeltaState,
@@ -11622,30 +11623,66 @@ function piAgentDirCollidesWithOmp(env = process.env) {
   return path.resolve(piAgentDir) === path.resolve(ompAgentDir);
 }
 
+function resolvePiAgentDirs(env = process.env) {
+  const agentDirs = [];
+  const defaultAgentDir = resolvePiAgentDir(env);
+  const cindyAgentDirs = process.platform !== "win32" || wsl.shouldProbeNative(env)
+    ? resolveCindyAgentHomes("pi", { env })
+    : [];
+  const cindyAgentKeys = new Set(cindyAgentDirs.map((dir) => pathIdentity(dir)));
+  if (defaultAgentDir && cindyAgentKeys.has(pathIdentity(defaultAgentDir))) {
+    const home = env.HOME || env.USERPROFILE || os.homedir();
+    agentDirs.push(path.join(home, ".pi", "agent"));
+  }
+  if (defaultAgentDir) agentDirs.push(defaultAgentDir);
+  agentDirs.push(...cindyAgentDirs);
+  const ompAgentDir = resolveOmpAgentDir(env);
+  const ompKey = ompAgentDir ? pathIdentity(ompAgentDir) : null;
+  const seenAgentDirs = new Set();
+  const resolved = [];
+  for (const agentDir of agentDirs) {
+    const agentKey = pathIdentity(agentDir);
+    if (seenAgentDirs.has(agentKey) || agentKey === ompKey) continue;
+    seenAgentDirs.add(agentKey);
+    resolved.push(agentDir);
+  }
+  return resolved;
+}
+
 function resolvePiSessionFiles(env = process.env) {
-  const agentDir = resolvePiAgentDir(env);
-  if (!agentDir) return [];
-  const sessionsDir = path.join(agentDir, "sessions");
-  if (!fssync.existsSync(sessionsDir)) return [];
+  const seenFiles = new Set();
   const files = [];
-  try {
-    for (const cwdDir of fssync.readdirSync(sessionsDir)) {
-      const cwdPath = path.join(sessionsDir, cwdDir);
-      let stat;
-      try { stat = fssync.statSync(cwdPath); } catch { continue; }
-      if (!stat.isDirectory()) continue;
-      let entries;
-      try { entries = fssync.readdirSync(cwdPath); } catch { continue; }
-      for (const entry of entries) {
-        if (!entry.endsWith(".jsonl")) continue;
-        files.push(path.join(cwdPath, entry));
+  for (const agentDir of resolvePiAgentDirs(env)) {
+    const sessionsDir = path.join(agentDir, "sessions");
+    if (!fssync.existsSync(sessionsDir)) continue;
+    try {
+      for (const entry of fssync.readdirSync(sessionsDir, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+          addPiSessionFile(path.join(sessionsDir, entry.name), seenFiles, files);
+          continue;
+        }
+        if (!entry.isDirectory()) continue;
+        const cwdPath = path.join(sessionsDir, entry.name);
+        let nestedEntries;
+        try { nestedEntries = fssync.readdirSync(cwdPath, { withFileTypes: true }); } catch { continue; }
+        for (const nested of nestedEntries) {
+          if (!nested.isFile() || !nested.name.endsWith(".jsonl")) continue;
+          addPiSessionFile(path.join(cwdPath, nested.name), seenFiles, files);
+        }
       }
+    } catch {
+      // ignore — continue with other installs
     }
-  } catch {
-    // ignore — return what we have
   }
   files.sort((a, b) => a.localeCompare(b));
   return files;
+}
+
+function addPiSessionFile(filePath, seenFiles, files) {
+  const key = pathIdentity(filePath);
+  if (seenFiles.has(key)) return;
+  seenFiles.add(key);
+  files.push(filePath);
 }
 
 function resolvePiDefaultModel() {
@@ -15501,6 +15538,7 @@ module.exports = {
   parseDroidIncremental,
   resolvePiHome,
   resolvePiAgentDir,
+  resolvePiAgentDirs,
   resolvePiSessionFiles,
   resolvePiDefaultModel,
   parsePiIncremental,

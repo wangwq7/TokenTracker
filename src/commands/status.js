@@ -57,9 +57,8 @@ const {
   resolveWorkbuddyProjectFiles,
   resolveOmpSessionFiles,
   resolveOmpAgentDir,
+  resolvePiAgentDirs,
   resolvePiSessionFiles,
-  resolvePiAgentDir,
-  piAgentDirCollidesWithOmp,
   resolveCraftSessionFiles,
   resolveCraftConfigDir,
   resolveKilocodeTaskFiles,
@@ -83,6 +82,7 @@ const {
 const wsl = require("../lib/wsl-probe");
 const { getWslMode, isInvalidWslMode, shouldProbeWsl, discoverWslHome } = wsl;
 const { resolveInstallPaths } = require("../lib/install-resolver");
+const { resolveCindyAgentHomes, pathIdentity } = require("../lib/cindy-paths");
 const { probeGrokHookState, resolveGrokHome } = require("../lib/grok-hook");
 const { probeOmpHookState } = require("../lib/omp-hook");
 
@@ -320,13 +320,31 @@ async function cmdStatus(argv = []) {
   {
     const claudeHomesStatus = [];
     if (process.platform !== "win32" || wsl.shouldProbeNative(process.env)) {
-      claudeHomesStatus.push({ dir: path.join(home, ".claude"), label: "native" });
+      const cindyClaudeHomes = resolveCindyAgentHomes("claude", { env: process.env, home });
+      const cindyClaudeKeys = new Set(cindyClaudeHomes.map((dir) => pathIdentity(dir)));
+      const configuredClaudeIsCindy = Boolean(
+        process.env.CLAUDE_CONFIG_DIR
+        && cindyClaudeKeys.has(pathIdentity(process.env.CLAUDE_CONFIG_DIR)),
+      );
+      if (!process.env.CLAUDE_CONFIG_DIR || configuredClaudeIsCindy) {
+        claudeHomesStatus.push({ dir: path.join(home, ".claude"), label: "native" });
+      }
+      for (const dir of cindyClaudeHomes) {
+        claudeHomesStatus.push({ dir, label: "Cindy" });
+      }
+      if (process.env.CLAUDE_CONFIG_DIR) {
+        claudeHomesStatus.push({ dir: process.env.CLAUDE_CONFIG_DIR, label: "configured" });
+      }
     }
     const wslClaudeHomeStatus = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
       ? wsl.discoverWslHome(".claude")
       : null;
     if (wslClaudeHomeStatus) claudeHomesStatus.push({ dir: wslClaudeHomeStatus, label: "WSL" });
+    const seenClaudeHomes = new Set();
     for (const { dir, label } of claudeHomesStatus) {
+      const key = pathIdentity(dir);
+      if (seenClaudeHomes.has(key)) continue;
+      seenClaudeHomes.add(key);
       const projects = path.join(dir, "projects");
       try {
         if (fssync.existsSync(projects)) claudeCodeActive.push(`${label}: ${projects}`);
@@ -367,10 +385,12 @@ async function cmdStatus(argv = []) {
   const ompHookState = await probeOmpHookState({ home, trackerDir, env: process.env });
 
   // pi (@mariozechner/pi-coding-agent) — passive scan only (no hooks).
-  // Skip when its agent dir collides with omp's; sync would dedupe anyway.
-  const piCollides = piAgentDirCollidesWithOmp(process.env);
-  const piAgentDir = resolvePiAgentDir(process.env);
-  const piInstalled = !piCollides && Boolean(piAgentDir) && fssync.existsSync(path.join(piAgentDir, "sessions"));
+  // The resolver unions system + Cindy installs and excludes only paths owned
+  // by oh-my-pi, so one collision never hides another valid pi install.
+  const piAgentDirs = resolvePiAgentDirs(process.env);
+  const piInstalled = piAgentDirs.some((dir) => {
+    try { return fssync.existsSync(path.join(dir, "sessions")); } catch (_e) { return false; }
+  });
   const piFiles = piInstalled ? resolvePiSessionFiles(process.env) : [];
 
   // Craft Agents — passive scan only (no hooks).
@@ -507,7 +527,39 @@ async function cmdStatus(argv = []) {
     nativeValue: process.env.CODEX_HOME || path.join(home, ".codex"),
     wslDir: ".codex",
   });
-  const codexActive = formatResolvedPaths(codexPaths, "sessions");
+  const cindyCodexHomes = process.platform !== "win32" || wsl.shouldProbeNative(process.env)
+    ? resolveCindyAgentHomes("codex", { env: process.env, home })
+    : [];
+  const cindyCodexKeys = new Set(cindyCodexHomes.map((dir) => pathIdentity(dir)));
+  const codexHomesStatus = [];
+  if (process.env.CODEX_HOME && cindyCodexKeys.has(pathIdentity(process.env.CODEX_HOME))) {
+    codexHomesStatus.push({ dir: path.join(home, ".codex"), label: "native" });
+  }
+  if (codexPaths.native) {
+    codexHomesStatus.push({
+      dir: codexPaths.native,
+      label: wsl.isUncPath(codexPaths.native)
+        ? "WSL"
+        : (cindyCodexKeys.has(pathIdentity(codexPaths.native)) ? "Cindy" : "native"),
+    });
+  }
+  if (codexPaths.wsl) codexHomesStatus.push({ dir: codexPaths.wsl, label: "WSL" });
+  if (process.platform !== "win32" || wsl.shouldProbeNative(process.env)) {
+    for (const dir of cindyCodexHomes) {
+      codexHomesStatus.push({ dir, label: "Cindy" });
+    }
+  }
+  const codexActive = [];
+  const seenCodexHomes = new Set();
+  for (const { dir, label } of codexHomesStatus) {
+    const key = pathIdentity(dir);
+    if (seenCodexHomes.has(key)) continue;
+    seenCodexHomes.add(key);
+    const sessions = path.join(dir, "sessions");
+    try {
+      if (fssync.existsSync(sessions)) codexActive.push(`${label}: ${sessions}`);
+    } catch (_e) { }
+  }
   const codexInstalledStatus = codexActive.length > 0;
 
   // Kimi (passive sessions scan)
