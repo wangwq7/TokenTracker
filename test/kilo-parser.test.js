@@ -356,9 +356,15 @@ test("Kilo Code: normalizeKilocodeProviderToModel sanitizes vendor names and fal
 });
 
 test("Kilo Code: resolveKilocodeRoots honors TOKENTRACKER_KILOCODE_ROOTS env override", () => {
-  const env = { TOKENTRACKER_KILOCODE_ROOTS: "/tmp/fake-ide:/tmp/other-ide" };
+  const env = { TOKENTRACKER_KILOCODE_ROOTS: ["/tmp/fake-ide", "/tmp/other-ide"].join(path.delimiter) };
   const roots = resolveKilocodeRoots(env);
   assert.deepEqual(roots, ["/tmp/fake-ide", "/tmp/other-ide"]);
+});
+
+test("Kilo Code: resolveKilocodeRoots preserves Windows drive paths", { skip: process.platform !== "win32" }, () => {
+  const env = { TOKENTRACKER_KILOCODE_ROOTS: String.raw`C:\Kilo;D:\Other` };
+  const roots = resolveKilocodeRoots(env);
+  assert.deepEqual(roots, [String.raw`C:\Kilo`, String.raw`D:\Other`]);
 });
 
 test("Kilo Code: resolveKilocodeTaskFiles walks tasks/ under all IDE roots", async () => {
@@ -371,7 +377,7 @@ test("Kilo Code: resolveKilocodeTaskFiles walks tasks/ under all IDE roots", asy
       { ts: 2, type: "say", say: "api_req_started", text: JSON.stringify({ tokensIn: 1, tokensOut: 1 }) },
     ]);
     const env = {
-      TOKENTRACKER_KILOCODE_ROOTS: `${path.join(tmp, "Cursor")}:${path.join(tmp, "Code")}`,
+      TOKENTRACKER_KILOCODE_ROOTS: [path.join(tmp, "Cursor"), path.join(tmp, "Code")].join(path.delimiter),
     };
     const taskFiles = resolveKilocodeTaskFiles(env);
     assert.equal(taskFiles.length, 2);

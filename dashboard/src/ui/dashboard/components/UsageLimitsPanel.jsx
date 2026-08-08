@@ -588,7 +588,7 @@ function renderProviderGroup(id, data, mode, expanded, onToggle, options = {}) {
       badge = <StatusBadge label={copy("limits.label.antigravity_live")} tone="live" tooltip={copy("limits.tooltip.antigravity_live")} />;
     }
   }
-  if (id === "qoder" && data.cached) {
+  if ((id === "qoder" || id === "qoderCn") && data.cached) {
     badge = (
       <StatusBadge
         label={copy("limits.label.antigravity_cached")}
@@ -819,8 +819,8 @@ function useWidestLabelWidth(containerRef) {
   return labelWidth;
 }
 
-export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder, volcengine, deepseek, order, visibility, displayMode }) {
-  const dataById = { claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder, volcengine, deepseek };
+export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder, qoderCn, volcengine, deepseek, order, visibility, displayMode }) {
+  const dataById = { claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, qoder, qoderCn, volcengine, deepseek };
   const containerRef = useRef(null);
   const labelWidth = useWidestLabelWidth(containerRef);
   const [expandedId, setExpandedId] = useState(null);

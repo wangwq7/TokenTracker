@@ -61,7 +61,7 @@ test("resolveRoocodeTaskFiles finds tasks via TOKENTRACKER_KILOCODE_ROOTS env", 
   });
   const files = resolveRoocodeTaskFiles(fakeEnv(root));
   assert.equal(files.length, 2);
-  assert.match(files[0].filePath, /task-(a|b)\/ui_messages\.json$/);
+  assert.match(files[0].filePath, /task-(a|b)[\\/]ui_messages\.json$/);
   fs.rmSync(root, { recursive: true, force: true });
 });
 

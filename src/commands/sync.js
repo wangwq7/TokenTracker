@@ -15,6 +15,7 @@ const {
   writeJson,
   chmod600IfPossible,
   openLock,
+  inspectLock,
 } = require("../lib/fs");
 const { physicalJsonlRecords } = require("../lib/jsonl-lines");
 const {
@@ -29,6 +30,7 @@ const {
   readMimoDbMessages,
   readZcodeDbMessages,
   resolveQoderDbPaths,
+  resolveQoderCnDbPaths,
   readQoderDbMessages,
   resolveKiroDbPath,
   resolveKiroJsonlPath,
@@ -83,6 +85,7 @@ const {
   listAntigravityTranscripts,
   parseAntigravityIncremental,
   resolveCodebuddyProjectFiles,
+  codebuddyJsonlHasUsage,
   parseCodebuddyIncremental,
   resolveWorkbuddyProjectFiles,
   parseWorkbuddyIncremental,
@@ -142,6 +145,8 @@ const CURSOR_UNKNOWN_MIGRATION_KEY = "cursorUnknownPurge_2026_04";
 const ROLLOUT_CUMULATIVE_DELTA_MIGRATION_KEY = "rolloutCumulativeDeltaReparse_2026_05";
 const CLAUDE_MEM_OBSERVER_REINCLUDE_KEY = "claudeMemObserverReinclude_2026_05_v3";
 const GROK_APPEND_ONLY_REPAIR_MIGRATION_KEY = "grokAppendOnlyRepair_2026_05_v4";
+const CODEBUDDY_LOG_JSONL_REPAIR_KEY = "codebuddyLogJsonlOverlapRepair_2026_08";
+const WORKBUDDY_CONTEXT_USAGE_REPAIR_KEY = "workbuddyContextUsageRepair_2026_08";
 const CLAUDE_MEM_OBSERVER_PATH_SEGMENT = "--claude-mem-observer-sessions";
 // v1 had a cursor-format bug (wrote plain integer instead of {inode, offset,
 // updatedAt}), which made parseClaudeIncremental reread every jsonl from
@@ -274,6 +279,7 @@ const AUTO_SYNC_SOURCES = new Set([
   "openclaw",
   "pi",
   "qoder",
+  "qoder-cn",
   "roocode",
   "workbuddy",
   "zcode",
@@ -394,6 +400,38 @@ async function acquireSyncLock(
   }
 }
 
+const SYNC_SKIP_MARKER = "sync.skip.json";
+
+// A skipped sync used to exit 0 with no output whatsoever, so lock debris left
+// by a killed run stalled every parse for a day with no visible signal and
+// nothing for `tokentracker status` to report (issue #431). Leave a queryable
+// marker that separates ordinary contention (`lock_busy`) from a lease whose
+// owner is gone (`lock_debris`, the state that needs attention).
+async function recordSyncSkip(trackerDir, lockPath) {
+  const holder = await inspectLock(lockPath);
+  const reason = holder.exists && holder.pid && !holder.alive ? "lock_debris" : "lock_busy";
+  const detail = !holder.exists
+    ? "sync lock could not be acquired"
+    : holder.pid
+      ? `sync lock held by pid ${holder.pid} (${holder.alive ? "running" : "not running"})`
+      : "sync lock has no owner record";
+  await writeJson(path.join(trackerDir, SYNC_SKIP_MARKER), {
+    reason,
+    detail,
+    at: new Date().toISOString(),
+    lockPath,
+  });
+  return `Sync skipped: ${reason} — ${detail}\n`;
+}
+
+async function clearSyncSkip(trackerDir) {
+  try {
+    await fs.unlink(path.join(trackerDir, SYNC_SKIP_MARKER));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
 async function cmdSync(argv, context = {}) {
   const opts = parseArgs(argv);
   const diagnostics = context && typeof context === "object" ? context.diagnostics : null;
@@ -414,7 +452,13 @@ async function cmdSync(argv, context = {}) {
 
   const lockPath = path.join(trackerDir, "sync.lock");
   const lock = await acquireSyncLock(lockPath, opts, lockWaitOptions);
-  if (!lock) return;
+  if (!lock) {
+    // Warn on stderr so the notice reaches interactive and background runs
+    // alike without disturbing anything that parses sync's stdout.
+    process.stderr.write(await recordSyncSkip(trackerDir, lockPath));
+    return;
+  }
+  await clearSyncSkip(trackerDir);
 
   let progress = null;
   try {
@@ -614,7 +658,16 @@ async function cmdSync(argv, context = {}) {
       const wslCodexDir = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
         ? wsl.discoverWslHome(".codex")
         : null;
-      const codexPaths = resolveInstallPaths({ nativeValue: codexNativeValue, wslValue: wslCodexDir });
+      // resolveInstallPaths stays the single authority for wsl-first /
+      // native-first / wsl-only / native-only / both selection; requireAnyChild
+      // makes it validate that a candidate actually holds sessions/ or
+      // archived_sessions/ so an empty WSL ~/.codex shell cannot shadow the
+      // native install (issue #codex-wsl-shadow).
+      const codexPaths = resolveInstallPaths({
+        nativeValue: codexNativeValue,
+        wslValue: wslCodexDir,
+        requireAnyChild: ["sessions", "archived_sessions"],
+      });
       if (configuredCodexIsCindy) {
         sources.push({ source: "codex", sessionsDir: path.join(home, ".codex", "sessions"), codexInventoryCache: true });
         if (!isBackgroundLightweightSync || backgroundCodexUsageRepair) {
@@ -1183,6 +1236,57 @@ async function cmdSync(argv, context = {}) {
           };
         } catch (err) {
           warnProviderParseFailure("Qoder", err, opts);
+        }
+      }
+    }
+
+    // ── Qoder CN (国内版) — same SharedClientCache/local.db schema, separate
+    // Application Support/QoderCN data directory. Tracked as its own source
+    // with its own cursor namespace: the two DBs each number rowids from 1, so
+    // a shared cursor would mis-dedup across installs.
+    let qoderCnResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (sourceAllowed("qoder-cn")) {
+      const qoderCnPaths = resolveQoderCnDbPaths({
+        home,
+        env: process.env,
+        platform: process.platform,
+      });
+      if (qoderCnPaths.native || qoderCnPaths.wsl) {
+        if (progress?.enabled) {
+          progress.start(`Parsing Qoder CN ${renderBar(0)} | buckets 0`);
+        }
+        try {
+          const result = await multiInstallParse({
+            paths: qoderCnPaths,
+            parserFn: async ({ dbPath, ...rest }) => {
+              const dbMessages = await readQoderDbMessages(dbPath, { label: "Qoder CN" });
+              const parsed = await parseQoderDbIncremental({
+                dbMessages,
+                dbPath,
+                sourceKey: "qoder-cn",
+                cursorKey: "qoder-cn",
+                ...rest,
+              });
+              return {
+                recordsProcessed: parsed.messagesProcessed || 0,
+                eventsAggregated: parsed.eventsAggregated || 0,
+                bucketsQueued: parsed.bucketsQueued || 0,
+              };
+            },
+            providerName: "qoder-cn",
+            cursors,
+            queuePath,
+            projectQueuePath,
+            getParams: (dbPath) => ({ dbPath }),
+            onProgress: makeProviderProgress("Qoder CN"),
+          });
+          qoderCnResult = {
+            recordsProcessed: result.recordsProcessed || 0,
+            eventsAggregated: result.eventsAggregated || 0,
+            bucketsQueued: result.bucketsQueued || 0,
+          };
+        } catch (err) {
+          warnProviderParseFailure("Qoder CN", err, opts);
         }
       }
     }
@@ -1810,6 +1914,26 @@ async function cmdSync(argv, context = {}) {
     // Tencent's CodeBuddy CLI is a Claude Code clone; no hook system, so we
     // tail the per-session JSONL conversation logs incrementally on each sync.
     let codebuddyResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (isFullSourceScan && sourceAllowed("codebuddy")) {
+      const repairCodebuddyFiles = mergeBothFileSources({
+        resolveFiles: (env) => resolveCodebuddyProjectFiles({
+          ...env,
+          TOKENTRACKER_CODEBUDDY_LOG_FALLBACK: "1",
+        }),
+        env: process.env,
+      });
+      try {
+        await repairCodebuddyLogJsonlOverlap({
+          cursors,
+          queuePath,
+          queueStatePath,
+          codebuddyFiles: repairCodebuddyFiles,
+          env: process.env,
+        });
+      } catch (err) {
+        warnProviderParseFailure("CodeBuddy log/JSONL repair", err, opts);
+      }
+    }
     const codebuddyFiles = sourceAllowed("codebuddy")
       ? mergeBothFileSources({ resolveFiles: resolveCodebuddyProjectFiles, env: process.env })
       : [];
@@ -1846,6 +1970,19 @@ async function cmdSync(argv, context = {}) {
       ? mergeBothFileSources({ resolveFiles: resolveWorkbuddyProjectFiles, env: process.env })
       : [];
     if (sourceAllowed("workbuddy")) {
+      if (isFullSourceScan) {
+        try {
+          await repairWorkbuddyContextUsage({
+            cursors,
+            queuePath,
+            queueStatePath,
+            workbuddyFiles,
+            env: process.env,
+          });
+        } catch (err) {
+          warnProviderParseFailure("WorkBuddy context-usage repair", err, opts);
+        }
+      }
       if (progress?.enabled) {
         progress.start(`Parsing WorkBuddy ${renderBar(0)} | buckets 0`);
       }
@@ -2387,6 +2524,7 @@ async function cmdSync(argv, context = {}) {
       antigravityResult.filesProcessed +
       opencodeResult.filesProcessed +
       qoderResult.recordsProcessed +
+      qoderCnResult.recordsProcessed +
       claudeScienceResult.recordsProcessed +
       cursorResult.recordsProcessed +
       kiroResult.recordsProcessed +
@@ -2418,6 +2556,7 @@ async function cmdSync(argv, context = {}) {
       antigravityResult.bucketsQueued +
       opencodeResult.bucketsQueued +
       qoderResult.bucketsQueued +
+      qoderCnResult.bucketsQueued +
       claudeScienceResult.bucketsQueued +
       cursorResult.bucketsQueued +
       kiroResult.bucketsQueued +
@@ -2770,6 +2909,9 @@ module.exports = {
   acquireSyncLock,
   migrateCursorUnknownBuckets,
   migrateRolloutCumulativeDeltaBuckets,
+  repairCodebuddyLogJsonlOverlap,
+  repairWorkbuddyContextUsage,
+  WORKBUDDY_CONTEXT_USAGE_REPAIR_KEY,
   repairCodexRescanInflation,
   repairCodexForkReplayInflation,
   repairCodexInterleavedUsageInflation,
@@ -2784,6 +2926,7 @@ module.exports = {
   recordCodexColdScanAudit,
   CURSOR_UNKNOWN_MIGRATION_KEY,
   ROLLOUT_CUMULATIVE_DELTA_MIGRATION_KEY,
+  CODEBUDDY_LOG_JSONL_REPAIR_KEY,
   CODEX_RESCAN_DEDUP_REPAIR_KEY,
   CODEX_FORK_REPLAY_REPAIR_KEY,
   CODEX_USAGE_LINEAGE_REPAIR_KEY,
@@ -3847,6 +3990,386 @@ async function migrateRolloutCumulativeDeltaBuckets({ cursors, queuePath, rollou
   }
 
   cursors.migrations[ROLLOUT_CUMULATIVE_DELTA_MIGRATION_KEY] = new Date().toISOString();
+}
+
+function codebuddyUsageRowKey(row) {
+  if (!row || row.source !== "codebuddy") return null;
+  const model = typeof row.model === "string" && row.model ? row.model : "unknown";
+  const hourStart = typeof row.hour_start === "string" && row.hour_start ? row.hour_start : null;
+  return hourStart ? bucketKey("codebuddy", model, hourStart) : null;
+}
+
+function codebuddyZeroUsageRow(model, hourStart) {
+  return {
+    source: "codebuddy",
+    model: model || "unknown",
+    hour_start: hourStart,
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: 0,
+    billable_total_tokens: 0,
+    conversation_count: 0,
+  };
+}
+
+// Issue #403 historical repair. Before the JSONL usage fix, CodeBuddy could
+// ingest the same round-trip once from ~/.codebuddy/projects and once from the
+// IDE extension log. The forward resolver now disables logs whenever any JSONL
+// has usable rawUsage, but existing queues/hourly state need one guarded,
+// atomic rebuild so the old double-count is not left visible forever.
+async function repairCodebuddyLogJsonlOverlap({
+  cursors,
+  queuePath,
+  queueStatePath,
+  codebuddyFiles,
+  env = process.env,
+} = {}) {
+  if (!cursors || typeof cursors !== "object") return false;
+  const migrations = (cursors.migrations ||= {});
+  const prior = migrations[CODEBUDDY_LOG_JSONL_REPAIR_KEY];
+  if (prior && !(typeof prior === "object" && prior.skipped)) return false;
+
+  const files = Array.isArray(codebuddyFiles) ? codebuddyFiles : [];
+  const jsonlFiles = files.filter((filePath) => typeof filePath === "string" && filePath.endsWith(".jsonl"));
+  const logFiles = files.filter((filePath) => typeof filePath === "string" && filePath.endsWith(".log"));
+  const hasDetailedJsonl = jsonlFiles.some((filePath) => codebuddyJsonlHasUsage(filePath));
+
+  const hourly = cursors.hourly && typeof cursors.hourly === "object" ? cursors.hourly : {};
+  const liveHourlyKeys = new Set(
+    Object.keys(hourly.buckets || {}).filter((key) => key.startsWith("codebuddy|")),
+  );
+  let queueRaw = "";
+  try {
+    queueRaw = await fs.readFile(queuePath, "utf8");
+  } catch (e) {
+    if (e?.code !== "ENOENT") throw e;
+  }
+  const queueCodebuddyKeys = new Set();
+  const keptQueueLines = [];
+  for (const line of queueRaw.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch (_e) {
+      keptQueueLines.push(line);
+      continue;
+    }
+    const key = codebuddyUsageRowKey(row);
+    if (!key) {
+      keptQueueLines.push(line);
+      continue;
+    }
+    queueCodebuddyKeys.add(key);
+  }
+  const liveKeys = new Set([...liveHourlyKeys, ...queueCodebuddyKeys]);
+  if (liveKeys.size === 0) {
+    migrations[CODEBUDDY_LOG_JSONL_REPAIR_KEY] = {
+      status: "noop",
+      appliedAt: new Date().toISOString(),
+      reason: "no-codebuddy-history",
+    };
+    return false;
+  }
+
+  // Keep this condition retryable when old CodeBuddy history exists but the
+  // extension log is temporarily rotated/missing. A permanent no-op here
+  // would close the repair window before a later full scan can rediscover it.
+  if (jsonlFiles.length === 0 || logFiles.length === 0 || !hasDetailedJsonl) {
+    migrations[CODEBUDDY_LOG_JSONL_REPAIR_KEY] = {
+      skipped: true,
+      reason: "no-mixed-detailed-sources",
+      at: new Date().toISOString(),
+    };
+    return false;
+  }
+
+  // A rebuild from the currently discoverable JSONL is safe only if every
+  // file previously tailed by CodeBuddy is still available in this scan. If a
+  // rotated/deleted log is missing, retain the user's history and retry later
+  // rather than silently erasing an unreproducible bucket.
+  const discovered = new Set(files);
+  const priorFiles = cursors.codebuddy?.fileOffsets && typeof cursors.codebuddy.fileOffsets === "object"
+    ? Object.keys(cursors.codebuddy.fileOffsets)
+    : [];
+  const missingPriorFile = priorFiles.find((filePath) => !discovered.has(filePath));
+  if (missingPriorFile) {
+    migrations[CODEBUDDY_LOG_JSONL_REPAIR_KEY] = {
+      skipped: true,
+      reason: "codebuddy_file_unreproducible",
+      filePath: missingPriorFile,
+      at: new Date().toISOString(),
+    };
+    return false;
+  }
+
+  const tmpQueue = `${queuePath}.codebuddyrebuild.${process.pid}.${Date.now()}`;
+  const tmpCursors = {
+    version: 1,
+    hourly: { buckets: {}, groupQueued: {} },
+    codebuddy: {},
+  };
+  let rebuiltRows = [];
+  try {
+    await parseCodebuddyIncremental({
+      // Rebuild from both sources. The parser now preserves legacy-only log
+      // sessions while consuming mirrored log fingerprints against JSONL, so
+      // rebuilding JSONL alone would silently discard valid pre-rawUsage data.
+      projectFiles: files,
+      cursors: tmpCursors,
+      queuePath: tmpQueue,
+      env,
+    });
+    let rebuiltRaw = "";
+    try {
+      rebuiltRaw = await fs.readFile(tmpQueue, "utf8");
+    } catch (e) {
+      if (e?.code !== "ENOENT") throw e;
+    }
+    rebuiltRows = rebuiltRaw.split("\n").filter((line) => line.trim());
+  } catch (e) {
+    console.error("[sync] CodeBuddy log/JSONL repair: rebuild failed, leaving history untouched:", e?.message || e);
+    return false;
+  } finally {
+    await fs.rm(tmpQueue, { force: true }).catch(() => {});
+  }
+
+  const rebuiltKeys = new Set();
+  const validRebuiltRows = [];
+  for (const line of rebuiltRows) {
+    let row;
+    try { row = JSON.parse(line); } catch (_e) { continue; }
+    const key = codebuddyUsageRowKey(row);
+    if (!key) continue;
+    rebuiltKeys.add(key);
+    validRebuiltRows.push(line);
+  }
+  if (rebuiltKeys.size === 0) {
+    migrations[CODEBUDDY_LOG_JSONL_REPAIR_KEY] = {
+      skipped: true,
+      reason: "jsonl_rebuild_empty",
+      at: new Date().toISOString(),
+    };
+    return false;
+  }
+
+  const staleRetractions = [];
+  for (const key of liveKeys) {
+    if (rebuiltKeys.has(key)) continue;
+    const [, model, ...hourParts] = key.split("|");
+    staleRetractions.push(JSON.stringify(codebuddyZeroUsageRow(model, hourParts.join("|"))));
+  }
+
+  const nextQueueLines = keptQueueLines.concat(staleRetractions, validRebuiltRows);
+  await ensureDir(path.dirname(queuePath));
+  const queueTmp = `${queuePath}.tmp.${process.pid}.${Date.now()}`;
+  await fs.writeFile(queueTmp, nextQueueLines.length ? `${nextQueueLines.join("\n")}\n` : "", "utf8");
+  await fs.rename(queueTmp, queuePath);
+
+  const nextHourly = (cursors.hourly ||= { buckets: {}, groupQueued: {} });
+  nextHourly.buckets ||= {};
+  nextHourly.groupQueued ||= {};
+  for (const key of Object.keys(nextHourly.buckets)) {
+    if (key.startsWith("codebuddy|")) delete nextHourly.buckets[key];
+  }
+  for (const key of Object.keys(nextHourly.groupQueued)) {
+    if (key.startsWith("codebuddy|")) delete nextHourly.groupQueued[key];
+  }
+  for (const [key, bucket] of Object.entries(tmpCursors.hourly.buckets || {})) {
+    if (key.startsWith("codebuddy|")) nextHourly.buckets[key] = bucket;
+  }
+  for (const [key, value] of Object.entries(tmpCursors.hourly.groupQueued || {})) {
+    if (key.startsWith("codebuddy|")) nextHourly.groupQueued[key] = value;
+  }
+  cursors.codebuddy = tmpCursors.codebuddy || {};
+
+  let uploadState = {};
+  try { uploadState = JSON.parse(await fs.readFile(queueStatePath, "utf8")); } catch (_e) {}
+  uploadState.offset = 0;
+  uploadState.updatedAt = new Date().toISOString();
+  uploadState.note = "reset_after_codebuddy_log_jsonl_repair_2026_08";
+  await ensureDir(path.dirname(queueStatePath));
+  await fs.writeFile(queueStatePath, JSON.stringify(uploadState, null, 2) + "\n", "utf8");
+
+  migrations[CODEBUDDY_LOG_JSONL_REPAIR_KEY] = {
+    status: "applied",
+    appliedAt: new Date().toISOString(),
+    jsonlFiles: jsonlFiles.length,
+    logFiles: logFiles.length,
+    previousBuckets: liveKeys.size,
+    rebuiltBuckets: rebuiltKeys.size,
+    retractedBuckets: staleRetractions.length,
+  };
+  return true;
+}
+
+// WorkBuddy's 0.87.9 SQLite fallback treated the bounded session_usage.used
+// context snapshot as cumulative input tokens. A current database proves that
+// assumption false (`size` is a 192k context limit while trace input totals can
+// exceed it), so rebuild historical WorkBuddy buckets from JSONL/trace sources
+// once the new parser is available. The same missing-source guard used by the
+// other data migrations keeps this recoverable: if a previously contributing
+// file is gone, leave history untouched and stop adding new context snapshots.
+async function repairWorkbuddyContextUsage({
+  cursors,
+  queuePath,
+  queueStatePath,
+  workbuddyFiles,
+  env = process.env,
+} = {}) {
+  if (!cursors || typeof cursors !== "object") return false;
+  const migrations = (cursors.migrations ||= {});
+  const prior = migrations[WORKBUDDY_CONTEXT_USAGE_REPAIR_KEY];
+  if (prior && !(typeof prior === "object" && prior.skipped)) return false;
+
+  const hourly = cursors.hourly && typeof cursors.hourly === "object" ? cursors.hourly : {};
+  const liveHourlyKeys = new Set(
+    Object.keys(hourly.buckets || {}).filter((key) => key.startsWith("workbuddy|")),
+  );
+  let queueRaw = "";
+  try {
+    queueRaw = await fs.readFile(queuePath, "utf8");
+  } catch (e) {
+    if (e?.code !== "ENOENT") throw e;
+  }
+  const queueWorkbuddyKeys = new Set();
+  const keptQueueLines = [];
+  for (const line of queueRaw.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch (_e) {
+      keptQueueLines.push(line);
+      continue;
+    }
+    if (row && row.source === "workbuddy" && typeof row.model === "string" && typeof row.hour_start === "string") {
+      queueWorkbuddyKeys.add(bucketKey("workbuddy", row.model || "unknown", row.hour_start));
+    } else {
+      keptQueueLines.push(line);
+    }
+  }
+  const liveKeys = new Set([...liveHourlyKeys, ...queueWorkbuddyKeys]);
+  if (liveKeys.size === 0) {
+    migrations[WORKBUDDY_CONTEXT_USAGE_REPAIR_KEY] = {
+      status: "noop",
+      appliedAt: new Date().toISOString(),
+      reason: "no-workbuddy-history",
+    };
+    return false;
+  }
+
+  const files = Array.isArray(workbuddyFiles) ? workbuddyFiles : [];
+  const discoveredPaths = new Set(
+    files.map((entry) => typeof entry === "string" ? entry : entry?.path).filter(Boolean),
+  );
+  const priorFiles = cursors.workbuddy?.fileOffsets && typeof cursors.workbuddy.fileOffsets === "object"
+    ? Object.keys(cursors.workbuddy.fileOffsets)
+    : [];
+  if (files.length === 0 || priorFiles.some((filePath) => !discoveredPaths.has(filePath))) {
+    migrations[WORKBUDDY_CONTEXT_USAGE_REPAIR_KEY] = {
+      skipped: true,
+      reason: files.length === 0 ? "no-rebuild-sources" : "workbuddy_file_unreproducible",
+      at: new Date().toISOString(),
+    };
+    return false;
+  }
+
+  const tmpQueue = `${queuePath}.workbuddyrebuild.${process.pid}.${Date.now()}`;
+  const tmpCursors = {
+    version: 1,
+    hourly: { buckets: {}, groupQueued: {} },
+    workbuddy: {},
+  };
+  let rebuiltRows = [];
+  try {
+    await parseWorkbuddyIncremental({
+      projectFiles: files,
+      cursors: tmpCursors,
+      queuePath: tmpQueue,
+      env,
+    });
+    let rebuiltRaw = "";
+    try { rebuiltRaw = await fs.readFile(tmpQueue, "utf8"); } catch (e) {
+      if (e?.code !== "ENOENT") throw e;
+    }
+    rebuiltRows = rebuiltRaw.split("\n").filter((line) => line.trim());
+  } catch (e) {
+    console.error("[sync] WorkBuddy context-usage repair: rebuild failed, leaving history untouched:", e?.message || e);
+    return false;
+  } finally {
+    await fs.rm(tmpQueue, { force: true }).catch(() => {});
+  }
+
+  const rebuiltKeys = new Set();
+  const validRebuiltRows = [];
+  for (const line of rebuiltRows) {
+    let row;
+    try { row = JSON.parse(line); } catch (_e) { continue; }
+    if (!row || row.source !== "workbuddy" || typeof row.model !== "string" || typeof row.hour_start !== "string") continue;
+    rebuiltKeys.add(bucketKey("workbuddy", row.model || "unknown", row.hour_start));
+    validRebuiltRows.push(line);
+  }
+
+  const staleRetractions = [];
+  for (const key of liveKeys) {
+    if (rebuiltKeys.has(key)) continue;
+    const [, model, ...hourParts] = key.split("|");
+    staleRetractions.push(JSON.stringify({
+      source: "workbuddy",
+      model: model || "unknown",
+      hour_start: hourParts.join("|"),
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+      total_tokens: 0,
+      billable_total_tokens: 0,
+      conversation_count: 0,
+    }));
+  }
+
+  const nextQueueLines = keptQueueLines.concat(staleRetractions, validRebuiltRows);
+  await ensureDir(path.dirname(queuePath));
+  const queueTmp = `${queuePath}.tmp.${process.pid}.${Date.now()}`;
+  await fs.writeFile(queueTmp, nextQueueLines.length ? `${nextQueueLines.join("\n")}\n` : "", "utf8");
+  await fs.rename(queueTmp, queuePath);
+
+  const nextHourly = (cursors.hourly ||= { buckets: {}, groupQueued: {} });
+  nextHourly.buckets ||= {};
+  nextHourly.groupQueued ||= {};
+  for (const key of Object.keys(nextHourly.buckets)) {
+    if (key.startsWith("workbuddy|")) delete nextHourly.buckets[key];
+  }
+  for (const key of Object.keys(nextHourly.groupQueued)) {
+    if (key.startsWith("workbuddy|")) delete nextHourly.groupQueued[key];
+  }
+  for (const [key, bucket] of Object.entries(tmpCursors.hourly.buckets || {})) {
+    if (key.startsWith("workbuddy|")) nextHourly.buckets[key] = bucket;
+  }
+  for (const [key, value] of Object.entries(tmpCursors.hourly.groupQueued || {})) {
+    if (key.startsWith("workbuddy|")) nextHourly.groupQueued[key] = value;
+  }
+  cursors.workbuddy = tmpCursors.workbuddy || {};
+
+  let uploadState = {};
+  try { uploadState = JSON.parse(await fs.readFile(queueStatePath, "utf8")); } catch (_e) {}
+  uploadState.offset = 0;
+  uploadState.updatedAt = new Date().toISOString();
+  uploadState.note = "reset_after_workbuddy_context_usage_repair_2026_08";
+  await ensureDir(path.dirname(queueStatePath));
+  await fs.writeFile(queueStatePath, JSON.stringify(uploadState, null, 2) + "\n", "utf8");
+
+  migrations[WORKBUDDY_CONTEXT_USAGE_REPAIR_KEY] = {
+    status: "applied",
+    appliedAt: new Date().toISOString(),
+    previousBuckets: liveKeys.size,
+    rebuiltBuckets: rebuiltKeys.size,
+    retractedBuckets: staleRetractions.length,
+  };
+  return true;
 }
 
 // One-time repair (#187): rebuild codex hourly buckets that the inode-keyed

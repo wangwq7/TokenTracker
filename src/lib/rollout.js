@@ -1196,6 +1196,7 @@ async function parseOpencodeIncremental({
   const publicRepoCache = projectEnabled ? new Map() : null;
   const opencodeState = normalizeOpencodeState(cursors?.opencode);
   const messageIndex = opencodeState.messages;
+  const fingerprintIndex = buildOpencodeFingerprintIndex(messageIndex);
   const touchedBuckets = new Set();
   const defaultSource = normalizeSourceInput(source) || "opencode";
 
@@ -1256,6 +1257,7 @@ async function parseOpencodeIncremental({
     const result = await parseOpencodeMessageFile({
       filePath,
       messageIndex,
+      fingerprintIndex,
       fallbackTotals,
       fallbackMessageKey,
       hourlyState,
@@ -1280,10 +1282,13 @@ async function parseOpencodeIncremental({
     eventsAggregated += result.eventsAggregated;
 
     if (result.messageKey && result.shouldUpdate) {
-      messageIndex[result.messageKey] = {
-        lastTotals: result.lastTotals,
-        updatedAt: new Date().toISOString(),
-      };
+      recordOpencodeMessage({
+        messageIndex,
+        fingerprintIndex,
+        messageKey: result.messageKey,
+        totals: result.lastTotals,
+        fingerprint: result.fingerprint || null,
+      });
     }
 
     if (cb) {
@@ -2555,6 +2560,7 @@ async function parseGeminiFile({
 async function parseOpencodeMessageFile({
   filePath,
   messageIndex,
+  fingerprintIndex,
   fallbackTotals,
   fallbackMessageKey,
   hourlyState,
@@ -2609,9 +2615,22 @@ async function parseOpencodeMessageFile({
     return { messageKey, lastTotals, eventsAggregated: 0, shouldUpdate: false };
   }
 
+  // `Session.fork` re-materialises the parent's prefix under new message ids in
+  // a new session — count it once (issue #426, see deriveOpencodeMessageFingerprint).
+  const fingerprint = deriveOpencodeMessageFingerprint({ msg, totals: currentTotals, source });
+  if (!lastTotals && isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+    return { messageKey, lastTotals: null, fingerprint, eventsAggregated: 0, shouldUpdate: false };
+  }
+
   const delta = diffGeminiTotals(currentTotals, lastTotals);
   if (!delta || isAllZeroUsage(delta)) {
-    return { messageKey, lastTotals: currentTotals, eventsAggregated: 0, shouldUpdate: true };
+    return {
+      messageKey,
+      lastTotals: currentTotals,
+      fingerprint,
+      eventsAggregated: 0,
+      shouldUpdate: true,
+    };
   }
   delta.conversation_count = 1;
 
@@ -2651,7 +2670,13 @@ async function parseOpencodeMessageFile({
     addTotals(projectBucket.totals, delta);
     projectTouchedBuckets.add(projectBucketKey(projectKey, source, bucketStart));
   }
-  return { messageKey, lastTotals: currentTotals, eventsAggregated: 1, shouldUpdate: true };
+  return {
+    messageKey,
+    lastTotals: currentTotals,
+    fingerprint,
+    eventsAggregated: 1,
+    shouldUpdate: true,
+  };
 }
 
 async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets }) {
@@ -3192,6 +3217,110 @@ function deriveOpencodeMessageKey(msg, fallback) {
   const messageId = normalizeMessageKeyPart(msg?.id || msg?.messageID || msg?.messageId);
   if (sessionId && messageId) return `${sessionId}|${messageId}`;
   return fallback;
+}
+
+// ── OpenCode fork-copy dedup (issue #426) ──────────────────────────────────
+//
+// `Session.fork` copies every parent message up to the fork point into a BRAND
+// NEW session. Verified against the shipped opencode binary: the copy is
+// `{ ...parentMessage.info, sessionID: newSession.id, id: newMessageId }` — so
+// `time.created`, `time.completed`, `modelID`, `providerID` and the entire
+// `tokens` payload survive verbatim and only the two identity fields change.
+// The forked session is created WITHOUT a parentID (confirmed empirically:
+// POST /session/:id/fork returns parentID=null), so the copies cannot be linked
+// to their origin by ancestry — content is the only available discriminator.
+// Because our dedup key is `sessionID|messageID`, every copied prefix used to be
+// counted a second time (a real fork of a 170-message session re-added 20.3M
+// tokens; the reporter measured ~2.0B across ~20 forks).
+//
+// The fingerprint is deliberately narrow — issue #187 is the standing reminder
+// that a loose dedup predicate deletes real usage. A collision requires the SAME
+// millisecond for BOTH created and completed, byte-equal values in all five
+// token columns, the same model, the same provider AND the same source. On top
+// of that we only ever drop a match that lives in a DIFFERENT session, since
+// forking always mints a new one — two turns inside one session are never
+// treated as copies of each other.
+function deriveOpencodeMessageFingerprint({ msg, totals, source }) {
+  if (!totals || isAllZeroUsage(totals)) return null;
+  const created = coerceEpochMs(msg?.time?.created) || 0;
+  const completed = coerceEpochMs(msg?.time?.completed) || 0;
+  if (!created && !completed) return null;
+  const model = normalizeModelInput(msg?.modelID || msg?.model || msg?.modelId) || DEFAULT_MODEL;
+  const provider = normalizeMessageKeyPart(msg?.providerID || msg?.provider || msg?.providerId);
+  const raw = [
+    normalizeSourceInput(source) || "opencode",
+    created,
+    completed,
+    totals.input_tokens,
+    totals.output_tokens,
+    totals.cached_input_tokens,
+    totals.cache_creation_input_tokens,
+    totals.reasoning_output_tokens,
+    model,
+    provider,
+  ].join(" ");
+  // Hashed rather than stored raw: the fingerprint is persisted per message in
+  // cursors.json, and heavy OpenCode users carry tens of thousands of entries.
+  return crypto.createHash("sha256").update(raw).digest("base64url").slice(0, 22);
+}
+
+// `fingerprint -> messageKey` for the messages already counted in this cursor
+// namespace. Rebuilt per parse run; entries written before this version carry no
+// fingerprint and simply do not participate (no retroactive rewrite of history).
+function buildOpencodeFingerprintIndex(messageIndex) {
+  const byFingerprint = new Map();
+  if (!messageIndex || typeof messageIndex !== "object") return byFingerprint;
+  for (const [key, entry] of Object.entries(messageIndex)) {
+    const fingerprint = entry && typeof entry.fingerprint === "string" ? entry.fingerprint : null;
+    if (fingerprint && !byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, key);
+  }
+  return byFingerprint;
+}
+
+function opencodeMessageKeySession(messageKey) {
+  if (typeof messageKey !== "string") return null;
+  const idx = messageKey.indexOf("|");
+  return idx > 0 ? messageKey.slice(0, idx) : null;
+}
+
+// True only when an already-counted message in ANOTHER session carries the exact
+// same fingerprint — i.e. this row is a fork copy. Keys without a resolvable
+// session (the JSON reader's file-path fallback) never dedup: unproven identity
+// must not delete usage.
+function isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey) {
+  if (!fingerprint || !fingerprintIndex) return false;
+  const owner = fingerprintIndex.get(fingerprint);
+  if (!owner || owner === messageKey) return false;
+  const ownerSession = opencodeMessageKeySession(owner);
+  const session = opencodeMessageKeySession(messageKey);
+  if (!ownerSession || !session) return false;
+  return ownerSession !== session;
+}
+
+// Persist a message's snapshot + fingerprint and claim the fingerprint for it.
+// Writes only when something actually changed so a steady-state sync leaves the
+// cursor untouched. A falsy `fingerprint` means "unknown" and preserves whatever
+// the entry already carried; a new one releases the old claim so a stale
+// mid-stream snapshot cannot shadow an unrelated message later.
+function recordOpencodeMessage({ messageIndex, fingerprintIndex, messageKey, totals, fingerprint }) {
+  if (!messageIndex || !messageKey) return;
+  const prev = messageIndex[messageKey];
+  const prevTotals = prev && typeof prev.lastTotals === "object" ? prev.lastTotals : null;
+  const prevFingerprint = prev && typeof prev.fingerprint === "string" ? prev.fingerprint : null;
+  const nextFingerprint = fingerprint || prevFingerprint;
+  if (sameGeminiTotals(totals, prevTotals) && prevFingerprint === nextFingerprint) return;
+
+  if (fingerprintIndex && prevFingerprint && prevFingerprint !== nextFingerprint) {
+    if (fingerprintIndex.get(prevFingerprint) === messageKey) {
+      fingerprintIndex.delete(prevFingerprint);
+    }
+  }
+  const entry = { lastTotals: totals, updatedAt: new Date().toISOString() };
+  if (nextFingerprint) entry.fingerprint = nextFingerprint;
+  messageIndex[messageKey] = entry;
+  if (fingerprintIndex && nextFingerprint && !fingerprintIndex.has(nextFingerprint)) {
+    fingerprintIndex.set(nextFingerprint, messageKey);
+  }
 }
 
 function getHourlyBucket(state, source, model, hourStart) {
@@ -4220,6 +4349,7 @@ async function parseOpencodeDbIncremental({
   const cursorNamespace = typeof cursorKey === "string" && cursorKey.length > 0 ? cursorKey : "opencode";
   const opencodeState = normalizeOpencodeState(cursors?.[cursorNamespace]);
   const messageIndex = opencodeState.messages;
+  const fingerprintIndex = buildOpencodeFingerprintIndex(messageIndex);
   const touchedBuckets = new Set();
   const defaultSource = normalizeSourceInput(source) || "opencode";
 
@@ -4248,15 +4378,30 @@ async function parseOpencodeDbIncremental({
       continue;
     }
 
+    // A fork copy of an already-counted turn contributes nothing — skip it
+    // outright so it never claims an index entry of its own (issue #426).
+    const fingerprint = deriveOpencodeMessageFingerprint({
+      msg,
+      totals: currentTotals,
+      source: defaultSource,
+    });
+    if (!lastTotals && isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+      messagesProcessed += 1;
+      continue;
+    }
+
     const delta = diffGeminiTotals(currentTotals, lastTotals);
     if (!delta || isAllZeroUsage(delta)) {
-      // Update index with current totals even if no delta (normalization may have changed)
-      if (!sameGeminiTotals(currentTotals, lastTotals)) {
-        messageIndex[messageKey] = {
-          lastTotals: currentTotals,
-          updatedAt: new Date().toISOString(),
-        };
-      }
+      // Refresh the index even without a delta: normalization may have changed,
+      // and pre-#426 entries need their fingerprint backfilled so a fork taken
+      // from an old session is still recognised.
+      recordOpencodeMessage({
+        messageIndex,
+        fingerprintIndex,
+        messageKey,
+        totals: currentTotals,
+        fingerprint,
+      });
       messagesProcessed += 1;
       if (cb) {
         cb({
@@ -4313,10 +4458,13 @@ async function parseOpencodeDbIncremental({
       }
     }
 
-    messageIndex[messageKey] = {
-      lastTotals: currentTotals,
-      updatedAt: new Date().toISOString(),
-    };
+    recordOpencodeMessage({
+      messageIndex,
+      fingerprintIndex,
+      messageKey,
+      totals: currentTotals,
+      fingerprint,
+    });
     messagesProcessed += 1;
     eventsAggregated += 1;
 
@@ -4373,22 +4521,26 @@ function resolveQoderDbPath({
   home = os.homedir(),
   env = process.env,
   platform = process.platform,
+  appDir = "Qoder",
+  envPrefix = "QODER",
 } = {}) {
-  if (typeof env.QODER_DB_PATH === "string" && env.QODER_DB_PATH.trim()) {
-    return path.resolve(env.QODER_DB_PATH.trim());
+  const dbPathKey = `${envPrefix}_DB_PATH`;
+  const homeKey = `${envPrefix}_HOME`;
+  if (typeof env[dbPathKey] === "string" && env[dbPathKey].trim()) {
+    return path.resolve(env[dbPathKey].trim());
   }
   let root;
-  if (typeof env.QODER_HOME === "string" && env.QODER_HOME.trim()) {
-    root = path.resolve(env.QODER_HOME.trim());
+  if (typeof env[homeKey] === "string" && env[homeKey].trim()) {
+    root = path.resolve(env[homeKey].trim());
   } else if (platform === "darwin") {
-    root = path.join(home, "Library", "Application Support", "Qoder");
+    root = path.join(home, "Library", "Application Support", appDir);
   } else if (platform === "win32") {
     root = path.join(
       env.APPDATA || path.join(home, "AppData", "Roaming"),
-      "Qoder",
+      appDir,
     );
   } else {
-    root = path.join(home, ".config", "Qoder");
+    root = path.join(home, ".config", appDir);
   }
   return path.join(root, "SharedClientCache", "cache", "db", "local.db");
 }
@@ -4397,17 +4549,21 @@ function resolveQoderDbPaths({
   home = os.homedir(),
   env = process.env,
   platform = process.platform,
+  appDir = "Qoder",
+  envPrefix = "QODER",
   deps = {},
 } = {}) {
-  const nativeValue = resolveQoderDbPath({ home, env, platform });
-  if (platform !== "win32" || env.QODER_DB_PATH || env.QODER_HOME) {
+  const dbPathKey = `${envPrefix}_DB_PATH`;
+  const homeKey = `${envPrefix}_HOME`;
+  const nativeValue = resolveQoderDbPath({ home, env, platform, appDir, envPrefix });
+  if (platform !== "win32" || env[dbPathKey] || env[homeKey]) {
     return { native: nativeValue, wsl: null };
   }
   const existsSync = deps.existsSync || fssync.existsSync;
   const native = wsl.shouldProbeNative(env) && existsSync(nativeValue) ? nativeValue : null;
   const discoverWslHome = deps.discoverWslHome || wsl.discoverWslHome;
   const wslRoot = wsl.shouldProbeWsl(env)
-    ? discoverWslHome(".config/Qoder", { ...deps, env })
+    ? discoverWslHome(`.config/${appDir}`, { ...deps, env })
     : null;
   const wslValue = wslRoot
     ? path.join(wslRoot, "SharedClientCache", "cache", "db", "local.db")
@@ -4419,6 +4575,23 @@ function resolveQoderDbPaths({
     env,
     platform: "win32",
   });
+}
+
+// Qoder CN keeps its own data directory (Application Support/QoderCN on macOS,
+// AppData/Roaming/QoderCN on Windows, .config/QoderCN on Linux), so it needs
+// its own path resolution. The token schema is identical to the international
+// edition — the same QODER_USAGE_SQL and parser are reused with a distinct
+// source/cursor namespace to avoid rowid collisions between the two DBs. CN
+// honors its own env overrides (QODER_CN_DB_PATH / QODER_CN_HOME) so that
+// QODER_HOME/QODER_DB_PATH, which point at the international install, never
+// redirect the CN resolver onto the same database (that would double-count).
+function resolveQoderCnDbPaths({
+  home = os.homedir(),
+  env = process.env,
+  platform = process.platform,
+  deps = {},
+} = {}) {
+  return resolveQoderDbPaths({ home, env, platform, appDir: "QoderCN", envPrefix: "QODER_CN", deps });
 }
 
 async function readQoderDbMessages(dbPath, sqliteOptions = {}) {
@@ -4518,11 +4691,13 @@ async function parseQoderDbIncremental({
   projectQueuePath,
   onProgress,
   publicRepoResolver,
+  sourceKey = "qoder",
+  cursorKey = "qoder",
 } = {}) {
   await ensureDir(path.dirname(queuePath));
   const rows = Array.isArray(dbMessages) ? dbMessages : [];
   const hourlyState = normalizeHourlyState(cursors?.hourly);
-  const qoderState = normalizeQoderState(cursors?.qoder);
+  const qoderState = normalizeQoderState(cursors?.[cursorKey]);
   const touchedBuckets = new Set();
   const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
   const projectState = projectEnabled ? normalizeProjectState(cursors?.projectHourly) : null;
@@ -4607,40 +4782,40 @@ async function parseQoderDbIncremental({
       if (previousTotals && previous.bucketStart && previous.model) {
         const oldBucket = getHourlyBucket(
           hourlyState,
-          "qoder",
+          sourceKey,
           previous.model,
           previous.bucketStart,
         );
         subtractTotals(oldBucket.totals, previousTotals);
-        touchedBuckets.add(bucketKey("qoder", previous.model, previous.bucketStart));
+        touchedBuckets.add(bucketKey(sourceKey, previous.model, previous.bucketStart));
         if (projectEnabled && previous.projectKey) {
           const oldProjectBucket = getProjectBucket(
             projectState,
             previous.projectKey,
-            "qoder",
+            sourceKey,
             previous.bucketStart,
             previous.projectRef || null,
           );
           subtractTotals(oldProjectBucket.totals, previousTotals);
           projectTouchedBuckets.add(
-            projectBucketKey(previous.projectKey, "qoder", previous.bucketStart),
+            projectBucketKey(previous.projectKey, sourceKey, previous.bucketStart),
           );
         }
       }
 
-      const bucket = getHourlyBucket(hourlyState, "qoder", model, bucketStart);
+      const bucket = getHourlyBucket(hourlyState, sourceKey, model, bucketStart);
       addTotals(bucket.totals, currentTotals);
-      touchedBuckets.add(bucketKey("qoder", model, bucketStart));
+      touchedBuckets.add(bucketKey(sourceKey, model, bucketStart));
       if (projectEnabled && projectKey) {
         const projectBucket = getProjectBucket(
           projectState,
           projectKey,
-          "qoder",
+          sourceKey,
           bucketStart,
           projectRef,
         );
         addTotals(projectBucket.totals, currentTotals);
-        projectTouchedBuckets.add(projectBucketKey(projectKey, "qoder", bucketStart));
+        projectTouchedBuckets.add(projectBucketKey(projectKey, sourceKey, bucketStart));
       }
       qoderState.messages[messageKey] = {
         totals: currentTotals,
@@ -4683,7 +4858,7 @@ async function parseQoderDbIncremental({
   hourlyState.updatedAt = updatedAt;
   qoderState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
-  cursors.qoder = qoderState;
+  cursors[cursorKey] = qoderState;
   if (projectState) {
     projectState.updatedAt = updatedAt;
     cursors.projectHourly = projectState;
@@ -7841,9 +8016,98 @@ function resolveCodebuddyDefaultModel(env = process.env) {
   return fallback;
 }
 
+// Modern CodeBuddy writes token usage into providerData.rawUsage on JSONL
+// records. Older IDE installs may have no usable JSONL usage and rely on the
+// extension log fallback below. Keep the sniff bounded: it is used by the
+// guarded historical migration to decide whether a JSONL rebuild is safe.
+function codebuddyJsonlHasUsage(filePath) {
+  let fd;
+  try {
+    fd = fssync.openSync(filePath, "r");
+    const buffer = Buffer.alloc(64 * 1024);
+    const bytesRead = fssync.readSync(fd, buffer, 0, buffer.length, 0);
+    const lines = buffer.toString("utf8", 0, bytesRead).split("\n");
+    const limit = Math.min(lines.length, 100);
+    for (let i = 0; i < limit; i += 1) {
+      const line = lines[i];
+      if (!line || (!line.includes("rawUsage") && !line.includes("\"usage\""))) continue;
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (!entry || typeof entry !== "object") continue;
+      const provider = entry.providerData;
+      if (provider && typeof provider === "object" && provider.rawUsage && typeof provider.rawUsage === "object") {
+        return true;
+      }
+      if (entry.usage && typeof entry.usage === "object") return true;
+    }
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { fssync.closeSync(fd); } catch {}
+    }
+  }
+  return false;
+}
+
+// Legacy IDE extension logs and modern JSONL records do not share an id. Keep
+// a bounded, source-neutral fingerprint ledger so a log line can be matched to
+// the JSONL round-trip it mirrors without collapsing legitimate same-second
+// requests. The ledger is persisted in the CodeBuddy cursor because the two
+// sources can arrive on different syncs.
+function codebuddyUsageFingerprint({ model, timestampMs, inputTokens, cacheRead, cacheCreation, outputTokens, reasoningTokens }) {
+  if (!Number.isFinite(Number(timestampMs)) || Number(timestampMs) <= 0) return null;
+  const second = Math.floor(Number(timestampMs) / 1000);
+  return [
+    second,
+    normalizeModelInput(model) || "unknown",
+    toNonNegativeInt(inputTokens),
+    toNonNegativeInt(cacheRead),
+    toNonNegativeInt(cacheCreation),
+    toNonNegativeInt(outputTokens),
+    toNonNegativeInt(reasoningTokens),
+  ].join(":");
+}
+
+function restoreCodebuddyUsageFingerprints(raw) {
+  const state = new Map();
+  if (!raw || typeof raw !== "object") return state;
+  for (const [key, value] of Object.entries(raw)) {
+    const jsonl = toNonNegativeInt(value?.jsonl);
+    const log = toNonNegativeInt(value?.log);
+    if (jsonl > 0 || log > 0) state.set(key, { jsonl, log });
+  }
+  return state;
+}
+
+function addCodebuddyJsonlFingerprint(state, fingerprint) {
+  if (!fingerprint) return false;
+  const current = state.get(fingerprint) || { jsonl: 0, log: 0 };
+  const mirrored = current.log > current.jsonl;
+  current.jsonl += 1;
+  state.set(fingerprint, current);
+  return mirrored;
+}
+
+function consumeCodebuddyLogFingerprint(state, fingerprint) {
+  if (!fingerprint) return false;
+  const current = state.get(fingerprint) || { jsonl: 0, log: 0 };
+  const mirrored = current.jsonl > current.log;
+  current.log += 1;
+  state.set(fingerprint, current);
+  return mirrored;
+}
+
+function capCodebuddyUsageFingerprints(state, maxEntries = 10_000) {
+  const entries = Array.from(state.entries());
+  if (entries.length <= maxEntries) return Object.fromEntries(entries);
+  return Object.fromEntries(entries.slice(entries.length - maxEntries));
+}
+
 function resolveCodebuddyProjectFiles(env = process.env) {
   const codebuddyHome = resolveCodebuddyHome(env);
-  const files = [];
+  const jsonlFiles = [];
+  const logFiles = [];
 
   // 1. Recursive JSONL scan in codebuddyHome/projects
   if (codebuddyHome) {
@@ -7864,7 +8128,7 @@ function resolveCodebuddyProjectFiles(env = process.env) {
             } catch { continue; }
           }
           if (isDir) walkJsonl(full);
-          else if (isFile && entry.name.endsWith(".jsonl")) files.push(full);
+          else if (isFile && entry.name.endsWith(".jsonl")) jsonlFiles.push(full);
         }
       };
       walkJsonl(projectsDir);
@@ -7917,10 +8181,10 @@ function resolveCodebuddyProjectFiles(env = process.env) {
           walkLogs(full);
         } else if (isFile && entry.name.endsWith(".log")) {
           if (root.pattern === "*.log") {
-            files.push(full);
+            logFiles.push(full);
           } else if (root.pattern === "codebuddy-extension-log") {
             if (full.toLowerCase().includes("tencent-cloud.coding-copilot")) {
-              files.push(full);
+              logFiles.push(full);
             }
           }
         }
@@ -7929,6 +8193,14 @@ function resolveCodebuddyProjectFiles(env = process.env) {
     walkLogs(root.dir);
   }
 
+  const fallbackMode = String(env.TOKENTRACKER_CODEBUDDY_LOG_FALLBACK || "").trim();
+  // Auto mode keeps both sources available. The parser performs bounded,
+  // count-aware cross-source fingerprint matching, so mixed histories retain
+  // legacy-only log sessions while mirrored rounds are counted once. Env=0 is
+  // still a supported escape hatch for users who want to suppress extension
+  // logs entirely; env=1 remains an explicit force-on value.
+  const includeLogs = fallbackMode !== "0";
+  const files = [...jsonlFiles, ...(includeLogs ? logFiles : [])];
   files.sort((a, b) => a.localeCompare(b));
   return files;
 }
@@ -7990,10 +8262,21 @@ async function parseCodebuddyIncremental({
     codebuddyState.logModelsByAgent && typeof codebuddyState.logModelsByAgent === "object"
       ? { ...codebuddyState.logModelsByAgent }
       : {};
+  const usageFingerprints = restoreCodebuddyUsageFingerprints(codebuddyState.usageFingerprints);
 
-  const files = Array.isArray(projectFiles)
+  const discoveredFiles = Array.isArray(projectFiles)
     ? projectFiles
     : resolveCodebuddyProjectFiles(env || process.env);
+  // JSONL must be parsed before extension logs so the fingerprint ledger can
+  // match mirrored rounds in the same sync. Keep the legacy bare-string API
+  // accepted for callers and tests.
+  const files = [...discoveredFiles].sort((a, b) => {
+    const aPath = typeof a === "string" ? a : a?.path || "";
+    const bPath = typeof b === "string" ? b : b?.path || "";
+    const aLog = aPath.endsWith(".log") ? 1 : 0;
+    const bLog = bPath.endsWith(".log") ? 1 : 0;
+    return aLog - bLog || aPath.localeCompare(bPath);
+  });
   const fallbackModel = defaultModel || resolveCodebuddyDefaultModel(env || process.env);
 
   if (files.length === 0) {
@@ -8001,6 +8284,7 @@ async function parseCodebuddyIncremental({
       ...codebuddyState,
       seenIds: Array.from(seenIds),
       fileOffsets,
+      usageFingerprints: capCodebuddyUsageFingerprints(usageFingerprints),
       updatedAt: new Date().toISOString(),
     };
     return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
@@ -8152,6 +8436,20 @@ async function parseCodebuddyIncremental({
           fallbackModel;
         const model = normalizeModelInput(rawModel);
 
+        const fingerprint = codebuddyUsageFingerprint({
+          model,
+          timestampMs: tsMs,
+          inputTokens,
+          cacheRead,
+          cacheCreation,
+          outputTokens: completionTokens,
+          reasoningTokens,
+        });
+        if (consumeCodebuddyLogFingerprint(usageFingerprints, fingerprint)) {
+          seenIds.add(messageId);
+          continue;
+        }
+
         const delta = {
           input_tokens: inputTokens,
           cached_input_tokens: cacheRead,
@@ -8180,9 +8478,15 @@ async function parseCodebuddyIncremental({
       } else {
         let entry;
         try { entry = JSON.parse(line); } catch { continue; }
+        if (!entry || typeof entry !== "object") continue;
 
-        if (!entry || entry.type !== "message" || entry.role !== "assistant") continue;
-
+        // Usage is carried on ANY record with providerData.rawUsage — assistant
+        // messages AND function_call records. Each LLM round-trip (whether it
+        // ends in a text reply or a tool call) carries its own usage; on real
+        // installs function_call records are ~93% of round-trips and ~14x the
+        // assistant-message token volume, so filtering by record type drops
+        // the majority of usage. Aggregate them all; dedup per round-trip.
+        // (Same convention as the WorkBuddy reader — same transcript format.)
         const provider = entry.providerData;
         const rawUsage = provider && typeof provider === "object" ? provider.rawUsage : null;
         if (!rawUsage || typeof rawUsage !== "object") continue;
@@ -8195,38 +8499,65 @@ async function parseCodebuddyIncremental({
           Number.isFinite(Number(entry.timestamp)) && Number(entry.timestamp) > 0
             ? Number(entry.timestamp)
             : null;
+        // One usage record per LLM round-trip; providerData.messageId is the
+        // response-level id shared by the function_call/message pair of the
+        // same round-trip, so it is the most stable dedup key. entry.id is the
+        // per-record append id (unique per line, NOT per round-trip) and must
+        // NOT be preferred — preferring it would count a round-trip once per
+        // record type instead of once total.
         const messageId =
-          typeof entry.uuid === "string" && entry.uuid
-            ? entry.uuid
-            : typeof entry.id === "string" && entry.id
-              ? entry.id
-              : tsMs != null
-                ? `${sessionId}:${tsMs}`
-                : null;
+          typeof provider?.messageId === "string" && provider?.messageId
+            ? provider.messageId
+            : typeof entry.uuid === "string" && entry.uuid
+              ? entry.uuid
+              : typeof entry.id === "string" && entry.id
+                ? entry.id
+                : tsMs != null
+                  ? `${sessionId}:${tsMs}`
+                  : null;
         if (!messageId) continue;
         if (seenIds.has(messageId)) continue;
 
         recordsProcessed++;
 
         const promptTokens = toNonNegativeInt(rawUsage.prompt_tokens);
-        const completionTokens = toNonNegativeInt(rawUsage.completion_tokens);
+        const completionTokensRaw = toNonNegativeInt(rawUsage.completion_tokens);
         const details =
           rawUsage.prompt_tokens_details && typeof rawUsage.prompt_tokens_details === "object"
             ? rawUsage.prompt_tokens_details
             : {};
-        const cachedTokens = toNonNegativeInt(details.cached_tokens);
+        const completionDetails =
+          rawUsage.completion_tokens_details && typeof rawUsage.completion_tokens_details === "object"
+            ? rawUsage.completion_tokens_details
+            : {};
+        // Cache-read mirrors three ways depending on upstream: Anthropic-style
+        // cache_read_input_tokens, OpenAI-style prompt_tokens_details.cached_tokens,
+        // DeepSeek-style prompt_cache_hit_tokens. Take the max (they mirror the
+        // same quantity; on real data exactly one is non-zero).
+        const cachedTokens = Math.max(
+          toNonNegativeInt(details.cached_tokens),
+          toNonNegativeInt(rawUsage.prompt_cache_hit_tokens),
+        );
         const cacheReadAlt = toNonNegativeInt(rawUsage.cache_read_input_tokens);
-        const cacheCreation = toNonNegativeInt(rawUsage.cache_creation_input_tokens);
-        const reasoningTokens = toNonNegativeInt(details.reasoning_tokens);
+        const cacheCreation = Math.max(
+          toNonNegativeInt(rawUsage.cache_creation_input_tokens),
+          toNonNegativeInt(rawUsage.prompt_cache_write_tokens),
+        );
+        // reasoning_tokens lives in completion_tokens_details (verified on real
+        // CodeBuddy data: prompt_tokens_details.reasoning_tokens is always 0).
+        // completion_tokens INCLUDES reasoning, so subtract to avoid double-count.
+        const reasoningTokens = Math.min(completionTokensRaw, toNonNegativeInt(completionDetails.reasoning_tokens));
+        const completionTokens = Math.max(0, completionTokensRaw - reasoningTokens);
 
         const cacheRead = Math.max(cachedTokens, cacheReadAlt);
-        const inputTokens = Math.max(0, promptTokens - cacheRead);
+        const inputTokens = Math.max(0, promptTokens - cacheRead - cacheCreation);
 
         if (
           inputTokens === 0 &&
           completionTokens === 0 &&
           cacheRead === 0 &&
-          cacheCreation === 0
+          cacheCreation === 0 &&
+          reasoningTokens === 0
         ) {
           seenIds.add(messageId);
           continue;
@@ -8245,6 +8576,20 @@ async function parseCodebuddyIncremental({
           normalizeModelInput(entry.model) ||
           fallbackModel;
 
+        const fingerprint = codebuddyUsageFingerprint({
+          model,
+          timestampMs: tsMs,
+          inputTokens,
+          cacheRead,
+          cacheCreation,
+          outputTokens: completionTokens,
+          reasoningTokens,
+        });
+        if (addCodebuddyJsonlFingerprint(usageFingerprints, fingerprint)) {
+          seenIds.add(messageId);
+          continue;
+        }
+
         const delta = {
           input_tokens: inputTokens,
           cached_input_tokens: cacheRead,
@@ -8260,6 +8605,13 @@ async function parseCodebuddyIncremental({
         addTotals(bucket.totals, delta);
         touchedBuckets.add(bucketKey("codebuddy", model, bucketStart));
         seenIds.add(messageId);
+        // Preserve the pre-fingerprint cursor key as well. Older releases
+        // keyed JSONL rows by entry.id; retaining it prevents the first
+        // post-upgrade sync from replaying an already-counted row when
+        // providerData.messageId is now preferred.
+        if (typeof entry.id === "string" && entry.id && entry.id !== messageId) {
+          seenIds.add(entry.id);
+        }
         eventsAggregated++;
 
         if (cb) {
@@ -8307,6 +8659,7 @@ async function parseCodebuddyIncremental({
     seenIds: cappedSeen,
     fileOffsets,
     logModelsByAgent: cappedLogModelsByAgent,
+    usageFingerprints: capCodebuddyUsageFingerprints(usageFingerprints),
     updatedAt,
   };
 
@@ -8357,6 +8710,14 @@ async function parseCodebuddyIncremental({
 //
 //   model is the auto-router placeholder ("auto") — WorkBuddy does not expose
 //   the underlying model in the log, so we emit it verbatim.
+//
+//   4. Completed ~/.workbuddy/traces/**/trace_*.json summaries expose aggregate
+//      modelInfo input/output/cache totals. They are a fallback only when the
+//      session has no detailed JSONL usage. The current SQLite session_usage
+//      table exposes bounded context-window state (`used`/`size`) plus credits,
+//      not billable token columns, so SQLite-only rows are ignored rather than
+//      mislabelled as input usage. A future schema with explicit token columns
+//      is accepted by workbuddySqliteUsageSnapshot.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function resolveWorkbuddyHome(env = process.env) {
@@ -8391,14 +8752,16 @@ function resolveWorkbuddyDefaultModel(env = process.env) {
 
 // Recursively collect every *.jsonl under ~/.workbuddy/projects so that
 // per-session conversation logs AND their nested subagents/agent-*.jsonl files
-// are both discovered. Non-.jsonl artefacts (tool-results/*.txt) are ignored.
+// are both discovered. WorkBuddy also writes completed trace summaries under
+// ~/.workbuddy/traces/<pid>/trace_*.json. Those summaries are useful only when
+// the detailed JSONL for a session is absent, so they are returned as typed
+// entries and parsed after JSONL (JSONL remains authoritative when both exist).
 function resolveWorkbuddyProjectFiles(env = process.env) {
   const workbuddyHome = resolveWorkbuddyHome(env);
   if (!workbuddyHome) return [];
   const projectsDir = path.join(workbuddyHome, "projects");
-  if (!fssync.existsSync(projectsDir)) return [];
   const files = [];
-  const walk = (dir) => {
+  const walkJsonl = (dir) => {
     let entries;
     try { entries = fssync.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
@@ -8413,13 +8776,87 @@ function resolveWorkbuddyProjectFiles(env = process.env) {
           isFile = st.isFile();
         } catch { continue; }
       }
-      if (isDir) walk(full);
+      if (isDir) walkJsonl(full);
       else if (isFile && entry.name.endsWith(".jsonl")) files.push(full);
     }
   };
-  walk(projectsDir);
-  files.sort((a, b) => a.localeCompare(b));
+  if (fssync.existsSync(projectsDir)) walkJsonl(projectsDir);
+
+  const tracesDir = path.join(workbuddyHome, "traces");
+  const walkTraces = (dir) => {
+    let entries;
+    try { entries = fssync.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      let isDir = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (!isDir && !isFile) {
+        try {
+          const st = fssync.statSync(full);
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch { continue; }
+      }
+      if (isDir) walkTraces(full);
+      else if (isFile && /^trace_[^/]+\.json$/i.test(entry.name)) {
+        files.push({ path: full, kind: "trace" });
+      }
+    }
+  };
+  if (fssync.existsSync(tracesDir)) walkTraces(tracesDir);
+  files.sort((a, b) => {
+    const aPath = typeof a === "string" ? a : a?.path || "";
+    const bPath = typeof b === "string" ? b : b?.path || "";
+    // JSONL first is intentional: trace summaries are a lossy fallback and
+    // must not win over a detailed rawUsage record on the same session.
+    const aKind = typeof a === "string" ? 0 : 1;
+    const bKind = typeof b === "string" ? 0 : 1;
+    return aKind - bKind || aPath.localeCompare(bPath);
+  });
   return files;
+}
+
+// WorkBuddy's current session_usage table stores context-window state in
+// `used`/`size` and model credit dollars in `credit_json`; neither is a token
+// accounting breakdown. Only consume a SQLite row when a future schema (or a
+// newer installation) exposes explicit cumulative token columns. This keeps
+// the fallback forward-compatible without treating a context snapshot as
+// billable usage.
+function workbuddySqliteUsageSnapshot(row) {
+  if (!row || typeof row !== "object") return null;
+  const hasAny = (keys) => keys.some((key) => Object.prototype.hasOwnProperty.call(row, key));
+  const inputKeys = ["input_tokens", "inputTokens", "prompt_tokens", "promptTokens"];
+  const cacheReadKeys = [
+    "cached_input_tokens",
+    "cachedInputTokens",
+    "cache_read_input_tokens",
+    "cacheReadInputTokens",
+    "cache_read_tokens",
+    "cacheReadTokens",
+  ];
+  const cacheCreationKeys = [
+    "cache_creation_input_tokens",
+    "cacheCreationInputTokens",
+    "prompt_cache_write_tokens",
+    "promptCacheWriteTokens",
+  ];
+  const outputKeys = ["output_tokens", "outputTokens", "completion_tokens", "completionTokens"];
+  const reasoningKeys = [
+    "reasoning_output_tokens",
+    "reasoningOutputTokens",
+    "reasoning_tokens",
+    "reasoningTokens",
+  ];
+  if (!hasAny([...inputKeys, ...cacheReadKeys, ...cacheCreationKeys, ...outputKeys, ...reasoningKeys])) {
+    return null;
+  }
+  return {
+    input: firstPresentNonNegativeInt(inputKeys.map((key) => row[key])),
+    cacheRead: firstPresentNonNegativeInt(cacheReadKeys.map((key) => row[key])),
+    cacheCreation: firstPresentNonNegativeInt(cacheCreationKeys.map((key) => row[key])),
+    output: firstPresentNonNegativeInt(outputKeys.map((key) => row[key])),
+    reasoning: firstPresentNonNegativeInt(reasoningKeys.map((key) => row[key])),
+  };
 }
 
 async function parseWorkbuddyIncremental({
@@ -8448,11 +8885,22 @@ async function parseWorkbuddyIncremental({
     workbuddyState.detailedSessions && typeof workbuddyState.detailedSessions === "object"
       ? { ...workbuddyState.detailedSessions }
       : {};
+  const seenTraceIds = new Set(
+    Array.isArray(workbuddyState.seenTraceIds) ? workbuddyState.seenTraceIds : [],
+  );
+  const tracedSessionIds = new Set(
+    Array.isArray(workbuddyState.tracedSessionIds) ? workbuddyState.tracedSessionIds : [],
+  );
   const detailedSessionsWithUsage = new Set();
 
-  const files = Array.isArray(projectFiles)
+  const allFiles = Array.isArray(projectFiles)
     ? projectFiles
     : resolveWorkbuddyProjectFiles(env || process.env);
+  const jsonlFiles = allFiles.filter((entry) => typeof entry === "string");
+  const traceFiles = allFiles.filter(
+    (entry) => entry && typeof entry === "object" && typeof entry.path === "string" && entry.kind === "trace",
+  );
+  const files = [...jsonlFiles, ...traceFiles];
   const fallbackModel = defaultModel || resolveWorkbuddyDefaultModel(env || process.env);
 
   const workbuddyHome = resolveWorkbuddyHome(env || process.env);
@@ -8463,6 +8911,8 @@ async function parseWorkbuddyIncremental({
     cursors.workbuddy = {
       ...workbuddyState,
       seenIds: Array.from(seenIds),
+      seenTraceIds: Array.from(seenTraceIds),
+      tracedSessionIds: Array.from(tracedSessionIds),
       fileOffsets,
       sqliteSessions,
       detailedSessions,
@@ -8477,8 +8927,8 @@ async function parseWorkbuddyIncremental({
   let recordsProcessed = 0;
   let eventsAggregated = 0;
 
-  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
-    const filePath = files[fileIdx];
+  for (let fileIdx = 0; fileIdx < jsonlFiles.length; fileIdx++) {
+    const filePath = jsonlFiles[fileIdx];
     let stat;
     try { stat = fssync.statSync(filePath); } catch { continue; }
 
@@ -8516,23 +8966,28 @@ async function parseWorkbuddyIncremental({
         typeof entry.sessionId === "string" && entry.sessionId
           ? entry.sessionId
           : path.basename(filePath, ".jsonl");
-      if (Object.prototype.hasOwnProperty.call(sqliteSessions, sessionId)) {
+      const sqliteSession = sqliteSessions[sessionId];
+      if (sqliteSession?.detailed || tracedSessionIds.has(sessionId)) {
         continue;
       }
       const tsMs =
         Number.isFinite(Number(entry.timestamp)) && Number(entry.timestamp) > 0
           ? Number(entry.timestamp)
           : null;
-      // One usage record per LLM round-trip; the response id is the most stable
-      // dedup key, then providerData.messageId, then session+timestamp.
+      // One usage record per LLM round-trip; providerData.messageId is the
+      // response-level id shared by function_call/message records and must win
+      // over the per-record append id. Fall back to entry.uuid/id only when the
+      // response-level id is absent.
       const messageId =
-        typeof entry.id === "string" && entry.id
-          ? entry.id
-          : typeof provider.messageId === "string" && provider.messageId
+        typeof provider?.messageId === "string" && provider.messageId
             ? provider.messageId
-            : tsMs != null
-              ? `${sessionId}:${tsMs}`
-              : null;
+            : typeof entry.uuid === "string" && entry.uuid
+              ? entry.uuid
+              : typeof entry.id === "string" && entry.id
+                ? entry.id
+                : tsMs != null
+                  ? `${sessionId}:${tsMs}`
+                  : null;
       if (!messageId) continue;
       if (seenIds.has(messageId)) continue;
 
@@ -8604,6 +9059,11 @@ async function parseWorkbuddyIncremental({
       addTotals(bucket.totals, delta);
       touchedBuckets.add(bucketKey("workbuddy", model, bucketStart));
       seenIds.add(messageId);
+      // Keep legacy entry-id keys alongside the response id so upgrading a
+      // cursor cannot replay a row that an older build already counted.
+      if (typeof entry.id === "string" && entry.id && entry.id !== messageId) {
+        seenIds.add(entry.id);
+      }
       detailedSessions[sessionId] = true;
       detailedSessionsWithUsage.add(sessionId);
       eventsAggregated++;
@@ -8628,14 +9088,105 @@ async function parseWorkbuddyIncremental({
     };
   }
 
+  // Trace summaries are a fallback for sessions whose JSONL has no detailed
+  // providerData.rawUsage. A trace's modelInfo totals include the cache read
+  // portion of input, so split input into uncached input + cached input. Do
+  // not merge a trace with the same session's JSONL (or SQLite) data: the
+  // JSONL path has per-round detail and the trace summary can be partial on
+  // older WorkBuddy versions.
+  for (let fileIdx = 0; fileIdx < traceFiles.length; fileIdx++) {
+    const entry = traceFiles[fileIdx];
+    const filePath = entry.path;
+    let stat;
+    try { stat = fssync.statSync(filePath); } catch { continue; }
+    const prevEntry = fileOffsets[filePath] || {};
+    const prevSize = Number(prevEntry.size) || 0;
+    const prevIno = prevEntry.ino;
+    const inodeChanged = typeof prevIno === "number" && prevIno !== stat.ino;
+    const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
+    if (stat.size <= startOffset) continue;
+
+    let traceDoc;
+    try {
+      traceDoc = JSON.parse(fssync.readFileSync(filePath, "utf8"));
+    } catch {
+      continue;
+    }
+    const trace = traceDoc && typeof traceDoc === "object" && traceDoc.trace && typeof traceDoc.trace === "object"
+      ? traceDoc.trace
+      : null;
+    const traceId = typeof trace?.traceId === "string" && trace.traceId
+      ? trace.traceId
+      : path.basename(filePath, ".json");
+    const metadata = trace?.metadata && typeof trace.metadata === "object" ? trace.metadata : {};
+    const modelInfo = trace?.modelInfo && typeof trace.modelInfo === "object"
+      ? trace.modelInfo
+      : metadata.modelInfo && typeof metadata.modelInfo === "object"
+        ? metadata.modelInfo
+        : {};
+    const sessionId =
+      (typeof trace?.sessionId === "string" && trace.sessionId) ||
+      (typeof metadata.sessionId === "string" && metadata.sessionId) ||
+      traceId;
+    const startedAtRaw = trace?.startedAt || metadata.startedAt;
+    const tsMs = typeof startedAtRaw === "number" && Number.isFinite(startedAtRaw)
+      ? (startedAtRaw > 10000000000 ? startedAtRaw : startedAtRaw * 1000)
+      : Date.parse(String(startedAtRaw || ""));
+    const totalInput = toNonNegativeInt(modelInfo.totalInputTokens);
+    const totalOutput = toNonNegativeInt(modelInfo.totalOutputTokens);
+    const totalCached = Math.min(totalInput, toNonNegativeInt(modelInfo.totalCachedTokens));
+    if (seenTraceIds.has(traceId) || detailedSessions[sessionId] || detailedSessionsWithUsage.has(sessionId) || tracedSessionIds.has(sessionId)) {
+      seenTraceIds.add(traceId);
+      fileOffsets[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+      continue;
+    }
+    if (!Number.isFinite(tsMs) || tsMs <= 0 || (totalInput <= 0 && totalOutput <= 0)) {
+      // Keep the file offset but do not permanently suppress a trace that may
+      // still be finalized in place by WorkBuddy.
+      fileOffsets[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+      continue;
+    }
+
+    const bucketStart = toUtcHalfHourStart(new Date(tsMs).toISOString());
+    if (!bucketStart) continue;
+    const model =
+      normalizeModelInput(Array.isArray(modelInfo.models) ? modelInfo.models[0] : modelInfo.model) ||
+      fallbackModel;
+    const inputTokens = Math.max(0, totalInput - totalCached);
+    const delta = {
+      input_tokens: inputTokens,
+      cached_input_tokens: totalCached,
+      cache_creation_input_tokens: 0,
+      output_tokens: totalOutput,
+      reasoning_output_tokens: 0,
+      total_tokens: inputTokens + totalCached + totalOutput,
+      conversation_count: 1,
+    };
+    const bucket = getHourlyBucket(hourlyState, "workbuddy", model, bucketStart);
+    addTotals(bucket.totals, delta);
+    touchedBuckets.add(bucketKey("workbuddy", model, bucketStart));
+    seenTraceIds.add(traceId);
+    tracedSessionIds.add(sessionId);
+    recordsProcessed++;
+    eventsAggregated++;
+    fileOffsets[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+    if (cb) {
+      cb({
+        index: jsonlFiles.length + fileIdx + 1,
+        total: files.length,
+        recordsProcessed,
+        eventsAggregated,
+        bucketsQueued: touchedBuckets.size,
+      });
+    }
+  }
+
   if (dbExists) {
     const query = `
       SELECT
-        su.session_id,
-        su.used,
-        su.updated_at,
-        s.model,
-        s.cwd
+        su.*,
+        s.model AS session_model,
+        s.cwd AS session_cwd
       FROM session_usage su
       LEFT JOIN sessions s ON s.id = su.session_id
       WHERE su.used IS NOT NULL
@@ -8660,35 +9211,74 @@ async function parseWorkbuddyIncremental({
         if (!row || typeof row !== "object") continue;
         const sessionId = typeof row.session_id === "string" ? row.session_id.trim() : "";
         if (!sessionId) continue;
-        if (detailedSessions[sessionId] || detailedSessionsWithUsage.has(sessionId)) continue;
+        if (
+          detailedSessions[sessionId] ||
+          detailedSessionsWithUsage.has(sessionId) ||
+          tracedSessionIds.has(sessionId)
+        ) continue;
 
-        const usedNow = toNonNegativeInt(row.used);
         const updatedAtRaw = toNonNegativeInt(row.updated_at);
-        const rawModel = typeof row.model === "string" ? row.model.trim() : "";
+        const rawModel = typeof row.session_model === "string"
+          ? row.session_model.trim()
+          : typeof row.model === "string" ? row.model.trim() : "";
 
-        if (usedNow <= 0 || updatedAtRaw <= 0) continue;
+        if (updatedAtRaw <= 0) continue;
 
-        const prev = sqliteSessions[sessionId] || { used: 0 };
-        const prevUsed = toNonNegativeInt(prev.used);
-        const isReset = usedNow > 0 && prevUsed > 0 && usedNow < prevUsed;
-        const inputDelta = isReset ? usedNow : Math.max(0, usedNow - prevUsed);
-        if (inputDelta === 0) {
+        const snapshot = workbuddySqliteUsageSnapshot(row);
+        const usedNow = toNonNegativeInt(row.used);
+        const prev = sqliteSessions[sessionId] || {};
+
+        // Current WorkBuddy releases expose only context state (`used` versus
+        // `size`) here. Do not turn that bounded snapshot into a fake usage
+        // delta; detailed JSONL/trace sources remain the authoritative path.
+        if (!snapshot) {
           sqliteSessions[sessionId] = {
             ...prev,
             used: usedNow,
             updatedAt: updatedAtRaw,
             model: rawModel || prev.model || fallbackModel,
+            detailed: false,
+          };
+          continue;
+        }
+
+        const previousTokens = prev.tokens && typeof prev.tokens === "object"
+          ? prev.tokens
+          : { input: 0, cacheRead: 0, cacheCreation: 0, output: 0, reasoning: 0 };
+        const isReset = ["input", "cacheRead", "cacheCreation", "output", "reasoning"]
+          .some((key) => snapshot[key] < toNonNegativeInt(previousTokens[key]));
+        const deltaTokens = {
+          input: isReset ? snapshot.input : Math.max(0, snapshot.input - toNonNegativeInt(previousTokens.input)),
+          cacheRead: isReset ? snapshot.cacheRead : Math.max(0, snapshot.cacheRead - toNonNegativeInt(previousTokens.cacheRead)),
+          cacheCreation: isReset ? snapshot.cacheCreation : Math.max(0, snapshot.cacheCreation - toNonNegativeInt(previousTokens.cacheCreation)),
+          output: isReset ? snapshot.output : Math.max(0, snapshot.output - toNonNegativeInt(previousTokens.output)),
+          reasoning: isReset ? snapshot.reasoning : Math.max(0, snapshot.reasoning - toNonNegativeInt(previousTokens.reasoning)),
+        };
+        if (
+          deltaTokens.input === 0 &&
+          deltaTokens.cacheRead === 0 &&
+          deltaTokens.cacheCreation === 0 &&
+          deltaTokens.output === 0 &&
+          deltaTokens.reasoning === 0
+        ) {
+          sqliteSessions[sessionId] = {
+            ...prev,
+            used: usedNow,
+            updatedAt: updatedAtRaw,
+            model: rawModel || prev.model || fallbackModel,
+            tokens: snapshot,
+            detailed: true,
           };
           continue;
         }
 
         recordsProcessed++;
 
-        const inputTokens = inputDelta;
-        const completionTokens = 0;
-        const cacheRead = 0;
-        const cacheCreation = 0;
-        const reasoningTokens = 0;
+        const inputTokens = deltaTokens.input;
+        const completionTokens = deltaTokens.output;
+        const cacheRead = deltaTokens.cacheRead;
+        const cacheCreation = deltaTokens.cacheCreation;
+        const reasoningTokens = deltaTokens.reasoning;
 
         const tsMs = updatedAtRaw > 10000000000 ? updatedAtRaw : updatedAtRaw * 1000;
         const tsIso = new Date(tsMs).toISOString();
@@ -8703,8 +9293,8 @@ async function parseWorkbuddyIncremental({
           cache_creation_input_tokens: cacheCreation,
           output_tokens: completionTokens,
           reasoning_output_tokens: reasoningTokens,
-          total_tokens: inputTokens,
-          conversation_count: prevUsed === 0 || isReset ? 1 : 0,
+        total_tokens: inputTokens + completionTokens + cacheRead + cacheCreation + reasoningTokens,
+          conversation_count: Object.keys(previousTokens).every((key) => toNonNegativeInt(previousTokens[key]) === 0) || isReset ? 1 : 0,
         };
 
         const bucket = getHourlyBucket(hourlyState, "workbuddy", model, bucketStart);
@@ -8714,6 +9304,8 @@ async function parseWorkbuddyIncremental({
           used: usedNow,
           updatedAt: updatedAtRaw,
           model,
+          tokens: snapshot,
+          detailed: true,
         };
         eventsAggregated++;
       }
@@ -8741,6 +9333,14 @@ async function parseWorkbuddyIncremental({
     detailedSessionEntries.length > 10_000
       ? Object.fromEntries(detailedSessionEntries.slice(detailedSessionEntries.length - 10_000))
       : detailedSessions;
+  const traceArr = Array.from(seenTraceIds);
+  const cappedSeenTraceIds =
+    traceArr.length > 10_000 ? traceArr.slice(traceArr.length - 10_000) : traceArr;
+  const tracedSessionArr = Array.from(tracedSessionIds);
+  const cappedTracedSessionIds =
+    tracedSessionArr.length > 10_000
+      ? tracedSessionArr.slice(tracedSessionArr.length - 10_000)
+      : tracedSessionArr;
 
   const bucketsQueued = await enqueueTouchedBuckets({
     queuePath,
@@ -8753,6 +9353,8 @@ async function parseWorkbuddyIncremental({
   cursors.workbuddy = {
     ...workbuddyState,
     seenIds: cappedSeen,
+    seenTraceIds: cappedSeenTraceIds,
+    tracedSessionIds: cappedTracedSessionIds,
     fileOffsets,
     sqliteSessions: cappedSqliteSessions,
     detailedSessions: cappedDetailedSessions,
@@ -8995,7 +9597,7 @@ async function resolveOmpFileCwd(filePath) {
 
 function resolveKilocodeRoots(env = process.env) {
   if (typeof env.TOKENTRACKER_KILOCODE_ROOTS === "string" && env.TOKENTRACKER_KILOCODE_ROOTS.trim()) {
-    return env.TOKENTRACKER_KILOCODE_ROOTS.split(":")
+    return env.TOKENTRACKER_KILOCODE_ROOTS.split(path.delimiter)
       .map((r) => r.trim())
       .filter(Boolean);
   }
@@ -11652,27 +12254,20 @@ function resolvePiAgentDirs(env = process.env) {
 function resolvePiSessionFiles(env = process.env) {
   const seenFiles = new Set();
   const files = [];
-  for (const agentDir of resolvePiAgentDirs(env)) {
-    const sessionsDir = path.join(agentDir, "sessions");
-    if (!fssync.existsSync(sessionsDir)) continue;
-    try {
-      for (const entry of fssync.readdirSync(sessionsDir, { withFileTypes: true })) {
-        if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-          addPiSessionFile(path.join(sessionsDir, entry.name), seenFiles, files);
-          continue;
-        }
-        if (!entry.isDirectory()) continue;
-        const cwdPath = path.join(sessionsDir, entry.name);
-        let nestedEntries;
-        try { nestedEntries = fssync.readdirSync(cwdPath, { withFileTypes: true }); } catch { continue; }
-        for (const nested of nestedEntries) {
-          if (!nested.isFile() || !nested.name.endsWith(".jsonl")) continue;
-          addPiSessionFile(path.join(cwdPath, nested.name), seenFiles, files);
-        }
+  const walk = (dir) => {
+    let entries;
+    try { entries = fssync.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        addPiSessionFile(full, seenFiles, files);
       }
-    } catch {
-      // ignore — continue with other installs
     }
+  };
+  for (const agentDir of resolvePiAgentDirs(env)) {
+    walk(path.join(agentDir, "sessions"));
   }
   files.sort((a, b) => a.localeCompare(b));
   return files;
@@ -15426,6 +16021,7 @@ module.exports = {
   readZcodeDbMessages,
   resolveQoderDbPath,
   resolveQoderDbPaths,
+  resolveQoderCnDbPaths,
   readQoderDbMessages,
   resolveKiroBasePath,
   resolveKiroDbPath,
@@ -15485,6 +16081,7 @@ module.exports = {
   resolveKimiCodeDefaultModel,
   parseKimiCodeIncremental,
   resolveCodebuddyHome,
+  codebuddyJsonlHasUsage,
   resolveCodebuddyProjectFiles,
   resolveCodebuddyDefaultModel,
   parseCodebuddyIncremental,

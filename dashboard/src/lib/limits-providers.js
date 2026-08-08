@@ -14,6 +14,7 @@ export const LIMIT_PROVIDER_IDS = [
   "zcode",
   "opencodeGo",
   "qoder",
+  "qoderCn",
   "volcengine",
   "deepseek",
 ];
@@ -34,6 +35,8 @@ export const LIMIT_PROVIDER_ICON_KEYS = {
   // (Go is a paid subscription tracked via dashboard scrape).
   opencodeGo: "OPENCODE",
   qoder: "QODER",
+  // Same Qoder brand mark — the CN edition is the same product family.
+  qoderCn: "QODER",
   volcengine: "VOLCENGINE",
   deepseek: "DEEPSEEK",
 };
@@ -68,6 +71,8 @@ export function limitProviderName(id) {
       return copy("limits.provider.opencode_go");
     case "qoder":
       return copy("limits.provider.qoder");
+    case "qoderCn":
+      return copy("limits.provider.qoder_cn");
     case "volcengine":
       return copy("limits.provider.volcengine");
     case "deepseek":

@@ -65,6 +65,7 @@ const {
   resolveRoocodeTaskFiles,
   resolveZedDbPath,
   resolveQoderDbPaths,
+  resolveQoderCnDbPaths,
   resolveClaudeScienceDbPaths,
   resolveAnythingllmDbPath,
   resolveGooseDbPath,
@@ -118,6 +119,7 @@ async function cmdStatus(argv = []) {
   const throttlePath = path.join(trackerDir, "sync.throttle");
   const uploadThrottlePath = path.join(trackerDir, "upload.throttle.json");
   const autoRetryPath = path.join(trackerDir, "auto.retry.json");
+  const syncSkipPath = path.join(trackerDir, "sync.skip.json");
   const codexHome = process.env.CODEX_HOME || path.join(home, ".codex");
   const codexConfigPath = path.join(codexHome, "config.toml");
   const codeHome = process.env.CODE_HOME || path.join(home, ".code");
@@ -153,6 +155,9 @@ async function cmdStatus(argv = []) {
     await readJson(uploadThrottlePath),
   );
   const autoRetry = await readJson(autoRetryPath);
+  // Written by sync whenever it had to skip a run. Present here so a stalled
+  // parse has a visible cause instead of only a frozen "Last parse".
+  const syncSkip = await readJson(syncSkipPath);
 
   const queueSize = await safeStatSize(queuePath);
   const pendingBytes = Math.max(0, queueSize - (queueState.offset || 0));
@@ -211,6 +216,11 @@ async function cmdStatus(argv = []) {
   const backoffUntil = parseEpochMsToIso(uploadThrottle.backoffUntilMs || null);
   const lastUploadError = uploadThrottle.lastError
     ? `${uploadThrottle.lastErrorAt || "unknown"} ${uploadThrottle.lastError}`
+    : null;
+  const syncSkipLine = syncSkip?.at
+    ? `- Last sync skipped: ${syncSkip.at} (${syncSkip.reason || "unknown"}${
+        syncSkip.detail ? `, ${syncSkip.detail}` : ""
+      })`
     : null;
   const autoRetryAt = parseEpochMsToIso(autoRetry?.retryAtMs || null);
   const autoRetryLine = autoRetryAt
@@ -447,6 +457,16 @@ async function cmdStatus(argv = []) {
   const qoderActive = formatResolvedPaths(qoderPaths);
   const qoderInstalled = qoderActive.length > 0;
   const qoderDbPath = qoderActive.join(" | ");
+
+  // Qoder CN (国内版) — same schema, separate Application Support/QoderCN dir.
+  const qoderCnPaths = resolveQoderCnDbPaths({
+    home,
+    env: process.env,
+    platform: process.platform,
+  });
+  const qoderCnActive = formatResolvedPaths(qoderCnPaths);
+  const qoderCnInstalled = qoderCnActive.length > 0;
+  const qoderCnDbPath = qoderCnActive.join(" | ");
 
   // Claude Science — token usage lives on the `frames` table of operon-cli.db.
   // Unlike the native/WSL pair other providers resolve to, this is an open-ended
@@ -783,6 +803,7 @@ async function cmdStatus(argv = []) {
       next_upload_after: nextUpload || null,
       backoff_until: backoffUntil || null,
       last_upload_error: lastUploadError || null,
+      last_sync_skipped: syncSkip?.at ? syncSkip : null,
       auto_retry: autoRetry || null,
       hooks: {
         codex_notify: notifyConfigured,
@@ -853,6 +874,9 @@ async function cmdStatus(argv = []) {
           : { installed: false },
         qoder: qoderInstalled
           ? { installed: true, detail: qoderDbPath }
+          : { installed: false },
+        "qoder-cn": qoderCnInstalled
+          ? { installed: true, detail: qoderCnDbPath }
           : { installed: false },
         "claude-science": claudeScienceInstalled
           ? { installed: true, detail: claudeScienceDbPath }
@@ -927,6 +951,7 @@ async function cmdStatus(argv = []) {
       `- Next upload after: ${nextUpload || "never"}`,
       `- Backoff until: ${backoffUntil || "never"}`,
       lastUploadError ? `- Last upload error: ${lastUploadError}` : null,
+      syncSkipLine,
       autoRetryLine,
       `- Codex notify: ${notifyConfigured ? JSON.stringify(codexNotify) : "unset"}`,
       `- Every Code notify: ${everyCodeConfigured ? JSON.stringify(everyCodeNotify) : "unset"}`,
@@ -977,6 +1002,9 @@ async function cmdStatus(argv = []) {
         : null,
       qoderInstalled
         ? `- Qoder: passive reader (${qoderDbPath})`
+        : null,
+      qoderCnInstalled
+        ? `- Qoder CN: passive reader (${qoderCnDbPath})`
         : null,
       claudeScienceInstalled
         ? `- Claude Science: passive reader (${claudeScienceDbPath})`
@@ -1185,6 +1213,12 @@ function renderLightTable(summary) {
   push("Next upload after", summary.next_upload_after);
   push("Backoff until", summary.backoff_until);
   if (summary.last_upload_error) push("Last upload error", summary.last_upload_error);
+  if (summary.last_sync_skipped) {
+    push(
+      "Last sync skipped",
+      `${summary.last_sync_skipped.at} (${summary.last_sync_skipped.reason || "unknown"})`,
+    );
+  }
 
   for (const [name, state] of Object.entries(summary.hooks || {})) {
     push(`Hook · ${name}`, state ? "set" : "unset");

@@ -113,6 +113,7 @@ describe("useLimitsDisplayPrefs", () => {
         "kiro",
         "opencodeGo",
         "qoder",
+        "qoderCn",
         "volcengine",
         "zcode",
       ].sort(),
