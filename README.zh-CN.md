@@ -39,7 +39,7 @@
 
 ## ⚡ 快速开始
 
-> **环境要求**：Node.js **20+**（CLI 支持 macOS / Linux / Windows；原生桌面 App 提供 macOS 菜单栏版与 Windows 系统托盘版；Cursor 的 SQLite 读取仅限 macOS）。
+> **环境要求**：Node.js **20+**（CLI 支持 macOS / Linux / Windows；原生桌面 App 提供 macOS 菜单栏版、Windows 系统托盘版与 Linux AppImage 托盘版；Cursor 的 SQLite 读取仅限 macOS）。
 
 ```bash
 npx tokentracker-cli
@@ -56,6 +56,7 @@ npx tokentracker-cli
 > **想要原生桌面 App？**
 > - **macOS** —— [下载 `TokenTrackerBar.dmg`](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTrackerBar.dmg) → 拖入「应用程序」即可。包含桌面小组件、菜单栏状态图标，以及同一套 Dashboard（跑在 WKWebView 里）。
 > - **Windows** —— [下载 `TokenTracker-Setup.exe`](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-Setup.exe) → 运行免管理员的单用户安装包即可。系统托盘 App，Dashboard 跑在 WebView2 里。便携版 zip 见[发布页](https://github.com/xiufengsun/TokenTracker/releases/latest)。
+> - **Linux** —— [下载 `TokenTracker-linux-x86_64.AppImage`](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-linux-x86_64.AppImage) → `chmod +x` 后直接运行。托盘 App，Dashboard 跑在 WebKitGTK 窗口里。需要发行版自带的 `webkit2gtk-4.1`、`gtk3`、`libayatana-appindicator`；GNOME 上托盘图标还需装 [AppIndicator 扩展](https://extensions.gnome.org/extension/615/appindicator-support/)。
 
 全局安装可以少敲字：
 

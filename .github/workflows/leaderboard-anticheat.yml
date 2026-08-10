@@ -1,12 +1,12 @@
-name: leaderboard anti-cheat health
+name: leaderboard anti-cheat scan
 
-# The backend detector runs hourly and high-confidence anomalies are soft-
-# excluded automatically by leaderboard refresh. This workflow is deliberately
-# read-only: it verifies that the public counts-only health endpoint remains
-# reachable and records the current state in the run summary. It never publishes
-# account identities or opens an operator ticket.
+# This workflow actively runs the protected backend detector. High-confidence
+# anomalies are reversibly blocked from further uploads, soft-excluded, and
+# removed from fresh leaderboard snapshots. Permanent purge/ban remains a human
+# decision. Public logs contain counts only, never account identities.
 
-# Poll shortly after the detector's :41 pg_cron pass.
+# Keep the database's :41 pg_cron scan as defense in depth; this independent
+# pass also proves the GitHub automation can execute the whole response loop.
 on:
   schedule:
     - cron: "53 * * * *"
@@ -20,42 +20,85 @@ permissions:
   contents: read
 
 jobs:
-  poll:
+  scan:
     runs-on: ubuntu-latest
     env:
       API: https://srctyff5.us-east.insforge.app/functions/tokentracker-leaderboard-refresh
     steps:
-      - name: Poll anomaly health
+      - name: Scan, isolate, and refresh leaderboard
+        env:
+          REFRESH_SECRET: ${{ secrets.LEADERBOARD_REFRESH_SECRET }}
         run: |
           set -euo pipefail
-          resp=$(curl -sS --max-time 30 "$API?anomalies=1")
-          echo "raw: $resp"
-
-          if ! jq -e '
-            .ok == true and
-            (.auto_excluded | type == "number") and
-            (.review | type == "number") and
-            (.max_peak_tokens | type == "number")
-          ' >/dev/null <<<"$resp"; then
-            echo "::error::anomaly health endpoint returned an invalid payload"
+          if [[ -z "${REFRESH_SECRET:-}" ]]; then
+            echo "::error::LEADERBOARD_REFRESH_SECRET is not configured"
             exit 1
           fi
 
-          excluded=$(jq -r '.auto_excluded' <<<"$resp")
-          review=$(jq -r '.review' <<<"$resp")
-          peak=$(jq -r '.max_peak_tokens' <<<"$resp")
-          latest=$(jq -r '.latest_detected_at // "n/a"' <<<"$resp")
+          scan=$(curl --fail-with-body -sS --max-time 120 \
+            --retry 2 --retry-delay 3 --retry-max-time 90 --retry-all-errors \
+            -X POST "$API" \
+            -H "Content-Type: application/json" \
+            -H "x-refresh-secret: $REFRESH_SECRET" \
+            --data '{"period":"week","scan_anomalies":true,"force_refresh":true,"source":"github-actions-anticheat"}')
+
+          if ! jq -e '
+            .ok == true and
+            (.scan.inserted_excluded | type == "number") and
+            (.scan.inserted_review | type == "number") and
+            (.scan.breaker_tripped | type == "boolean") and
+            (.scan.queue.auto_excluded | type == "number") and
+            (.scan.queue.review | type == "number") and
+            (.results.week.upserted | type == "number")
+          ' >/dev/null <<<"$scan"; then
+            echo "::error::anti-cheat scan returned an invalid payload"
+            exit 1
+          fi
+
+          excluded=$(jq -r '.scan.queue.auto_excluded' <<<"$scan")
+          review=$(jq -r '.scan.queue.review' <<<"$scan")
+          breaker=$(jq -r '.scan.breaker_tripped' <<<"$scan")
+          week_rows=$(jq -r '.results.week.upserted' <<<"$scan")
+
+          if (( excluded > 0 )); then
+            for period in month total; do
+              refreshed=$(curl --fail-with-body -sS --max-time 120 \
+                --retry 2 --retry-delay 3 --retry-max-time 90 --retry-all-errors \
+                -X POST "$API" \
+                -H "Content-Type: application/json" \
+                -H "x-refresh-secret: $REFRESH_SECRET" \
+                --data "{\"period\":\"$period\",\"force_refresh\":true,\"source\":\"github-actions-anticheat\"}")
+              jq -e --arg period "$period" \
+                '.ok == true and (.results[$period].upserted | type == "number")' \
+                >/dev/null <<<"$refreshed"
+            done
+          fi
+
+          health=$(curl --fail-with-body -sS --max-time 30 \
+            --retry 2 --retry-delay 3 --retry-max-time 60 --retry-all-errors \
+            "$API?anomalies=1")
+          jq -e --argjson excluded "$excluded" --argjson review "$review" '
+            .ok == true and
+            .auto_excluded == $excluded and
+            .review == $review
+          ' >/dev/null <<<"$health"
 
           {
-            echo "### Leaderboard anti-cheat health"
+            echo "### Leaderboard anti-cheat scan"
             echo
             echo "| state | count |"
             echo "|---|---:|"
             echo "| automatically excluded | $excluded |"
             echo "| review-only flags | $review |"
             echo
-            echo "- Largest flagged half-hour bucket: \`$peak\` tokens"
-            echo "- Latest detection: \`$latest\`"
-            echo
-            echo "High-confidence exclusions are enforced automatically by the backend."
+            echo "- Circuit breaker tripped: \`$breaker\`"
+            echo "- Week snapshot rows rebuilt: \`$week_rows\`"
+            echo "- Month/total rebuilt when exclusions were present: \`$([[ $excluded -gt 0 ]] && echo yes || echo no)\`"
+            echo "- Independent counts-only read-back: passed"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$breaker" == "true" ]]; then
+            echo "::warning::anti-cheat circuit breaker tripped; exclusions were downgraded to review"
+          elif (( review > 0 )); then
+            echo "::warning::$review anomaly flag(s) require human review"
+          fi

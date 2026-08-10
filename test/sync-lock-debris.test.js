@@ -141,6 +141,44 @@ test("sync lock never sweeps a live reclaim guard", async () => {
   });
 });
 
+// Deliberate behaviour, pinned so it is not "fixed" later. A guard is meant to
+// be held for one indivisible rename+recreate, so a live owner whose heartbeat
+// has not ticked for LOCK_STALE_MS means the filesystem holding the lock is
+// hung, not that the owner is healthy. Revoking is the escape hatch: a shorter
+// threshold would revoke MORE aggressively, and a longer one brings back the
+// permanent stall this sweep exists to break (issue #431).
+test("a guard whose owner is alive but heartbeat has gone stale is swept", async () => {
+  await withLockPath(async (lockPath) => {
+    await writeAbandonedLock(lockPath);
+    const guardPath = `${lockPath}.reclaim`;
+    const liveGuard = await openLock(guardPath, {
+      quietIfLocked: true,
+      serializeRelease: false,
+    });
+    assert.ok(liveGuard);
+
+    // Age every heartbeat belonging to the guard past the staleness window
+    // while this very much alive process still owns it.
+    const dir = path.dirname(guardPath);
+    const prefix = `${path.basename(guardPath)}.heartbeat.`;
+    const stale = (Date.now() - 10 * 60 * 1000) / 1000;
+    let aged = 0;
+    for (const name of await fs.readdir(dir)) {
+      if (!name.startsWith(prefix)) continue;
+      await fs.utimes(path.join(dir, name), stale, stale);
+      aged += 1;
+    }
+    assert.equal(aged, 1, "the guard should own exactly one heartbeat file");
+
+    const lock = await openLock(lockPath, { quietIfLocked: true });
+    assert.ok(lock, "a stale guard chain must not block acquisition forever");
+    assert.equal(await exists(guardPath), false, "the stale guard should be gone");
+
+    await lock.release();
+    await liveGuard.release().catch(() => {});
+  });
+});
+
 test("sync warns and records a queryable marker when the lock cannot be acquired", async () => {
   await withTempHome(async (home) => {
     const trackerDir = path.join(home, ".tokentracker", "tracker");
@@ -206,5 +244,22 @@ test("sync clears a stale skip marker once the lock is acquired again", async ()
     }
 
     assert.equal(await exists(markerPath), false);
+  });
+});
+
+test("sync releases its lock when stale skip marker cleanup fails", async () => {
+  await withTempHome(async (home) => {
+    const trackerDir = path.join(home, ".tokentracker", "tracker");
+    await fs.mkdir(path.join(trackerDir, "sync.skip.json"), { recursive: true });
+
+    await assert.rejects(cmdSync(["--auto"]), (error) => (
+      error?.code === "EISDIR" || error?.code === "EPERM"
+    ));
+
+    assert.equal(
+      await exists(path.join(trackerDir, "sync.lock")),
+      false,
+      "marker cleanup errors must not strand the acquired sync lease",
+    );
   });
 });

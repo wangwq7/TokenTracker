@@ -2,7 +2,20 @@ const fssync = require("node:fs");
 const path = require("node:path");
 const wsl = require("./wsl-probe");
 
-function resolveInstallPaths({ nativeValue, wslDir, wslValue, requireAnyChild } = {}, env = process.env, deps = {}) {
+// `union` (opt-in): return BOTH qualifying installs instead of a single pick.
+// The mode knob then means priority, not exclusivity — `wsl-first` orders the
+// roots, it does not delete the native install's usage (#27: a populated WSL
+// ~/.codex silently evicted the Windows install from collection, so the session
+// browser listed sessions whose tokens never reached the dashboard). The
+// *-only modes stay exclusive for free: their excluded side is already null'd
+// by the shouldProbe* guards below, so union returns exactly one root there.
+//
+// Only providers whose parser dedups by a path-independent identity may opt in
+// — the same session reachable under two path spellings (a WSL $HOME mounted
+// on the Windows profile) must collapse, not double-count. Codex qualifies via
+// its sessionUUID:eventTimestamp event dedup; Claude does the same union by
+// hand in sync.js with file-hash + message-hash dedup behind it.
+function resolveInstallPaths({ nativeValue, wslDir, wslValue, requireAnyChild, union } = {}, env = process.env, deps = {}) {
   const platform = deps.platform || process.platform;
   if (platform !== "win32") {
     return { native: nativeValue ?? null, wsl: null };
@@ -22,6 +35,10 @@ function resolveInstallPaths({ nativeValue, wslDir, wslValue, requireAnyChild } 
     : (wslDir && wsl.shouldProbeWsl(env) ? wsl.discoverWslHome(wslDir, { ...deps, env, existsSync: wslExists }) : null);
   const nativeCandidate = wsl.shouldProbeNative(env) && nativeValue && populated(nativeValue)
     ? pathExists(nativeValue, deps.existsSync) : null;
+
+  // Native first: the cross-root dedup keeps whichever copy is parsed first,
+  // so the native install stays primary (matching the Claude union).
+  if (union) return { native: nativeCandidate, wsl: wslCandidate };
 
   return wsl.resolveAllWin32Paths({ nativeValue: nativeCandidate, wslValue: wslCandidate, env, platform });
 }

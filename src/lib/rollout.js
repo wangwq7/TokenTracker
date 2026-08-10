@@ -330,15 +330,28 @@ async function parseRolloutIncremental({
   }) => {
     if (rebuildingBaseline) return true;
     if (prev && (!sameInode || truncated)) return true;
-    if (sameInode && !truncated && startOffset > 0) return false;
-    if (prev?.lastTotal) return true;
+
+    // Same session under another cursor path — the two roots of a `union`
+    // install (src/lib/install-resolver.js) reaching one file, or a
+    // sessions/ -> archived_sessions/ move. This MUST be decided before the
+    // steady-state short-circuit below: the append-only tracker only knows keys
+    // written during the current run, so when the other path has nothing new to
+    // read it contributes none, and a path whose cursor fell behind (a distro
+    // that was briefly unreachable, a TOKENTRACKER_WSL_MODE round-trip) replays
+    // its gap into the persisted buckets. Only the persisted set can catch that.
     const sessionId = codexSessionIdFromPath(filePath);
     if (!sessionId) return true;
     const knownPaths = getCursorSessionPaths().get(sessionId);
-    if (!knownPaths) return false;
-    for (const knownPath of knownPaths) {
-      if (knownPath !== filePath) return true;
+    if (knownPaths) {
+      for (const knownPath of knownPaths) {
+        if (knownPath !== filePath) return true;
+      }
     }
+
+    // Steady state: one path, already read past, not rotated. Everything after
+    // our own offset is genuinely new, so skip the persisted-set construction.
+    if (sameInode && !truncated && startOffset > 0) return false;
+    if (prev?.lastTotal) return true;
     return false;
   };
 
@@ -1221,7 +1234,11 @@ async function parseOpencodeIncremental({
     const size = Number.isFinite(st.size) ? st.size : 0;
     const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
     const unchanged =
-      prev && prev.inode === inode && prev.size === size && prev.mtimeMs === mtimeMs;
+      prev &&
+      prev.inode === inode &&
+      prev.size === size &&
+      prev.mtimeMs === mtimeMs &&
+      prev.opencodeForkRepairVersion === 1;
     if (unchanged) {
       filesProcessed += 1;
       if (cb) {
@@ -1275,6 +1292,7 @@ async function parseOpencodeIncremental({
       mtimeMs,
       lastTotals: result.lastTotals,
       messageKey: result.messageKey || null,
+      opencodeForkRepairVersion: 1,
       updatedAt: new Date().toISOString(),
     };
 
@@ -1288,6 +1306,7 @@ async function parseOpencodeIncremental({
         messageKey: result.messageKey,
         totals: result.lastTotals,
         fingerprint: result.fingerprint || null,
+        dedupedForkCopy: result.dedupedForkCopy === true,
       });
     }
 
@@ -2618,16 +2637,41 @@ async function parseOpencodeMessageFile({
   // `Session.fork` re-materialises the parent's prefix under new message ids in
   // a new session — count it once (issue #426, see deriveOpencodeMessageFingerprint).
   const fingerprint = deriveOpencodeMessageFingerprint({ msg, totals: currentTotals, source });
-  if (!lastTotals && isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
-    return { messageKey, lastTotals: null, fingerprint, eventsAggregated: 0, shouldUpdate: false };
+  if (isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+    if (lastTotals && prev?.dedupedForkCopy !== true) {
+      repairCountedOpencodeForkCopy({
+        msg,
+        totals: lastTotals,
+        source,
+        hourlyState,
+        touchedBuckets,
+        projectState,
+        projectTouchedBuckets,
+        projectRef,
+        projectKey,
+      });
+    }
+    return {
+      messageKey,
+      lastTotals: currentTotals,
+      fingerprint,
+      dedupedForkCopy: true,
+      eventsAggregated: 0,
+      shouldUpdate: prev?.dedupedForkCopy !== true || !lastTotals,
+    };
   }
 
-  const delta = diffGeminiTotals(currentTotals, lastTotals);
+  // A formerly deduped copy can become a genuinely distinct in-place update.
+  // Its prior totals were removed from the buckets, so re-add the full current
+  // snapshot instead of only the delta from the suppressed value.
+  const effectiveLastTotals = prev?.dedupedForkCopy === true ? null : lastTotals;
+  const delta = diffGeminiTotals(currentTotals, effectiveLastTotals);
   if (!delta || isAllZeroUsage(delta)) {
     return {
       messageKey,
       lastTotals: currentTotals,
       fingerprint,
+      dedupedForkCopy: false,
       eventsAggregated: 0,
       shouldUpdate: true,
     };
@@ -2674,6 +2718,7 @@ async function parseOpencodeMessageFile({
     messageKey,
     lastTotals: currentTotals,
     fingerprint,
+    dedupedForkCopy: false,
     eventsAggregated: 1,
     shouldUpdate: true,
   };
@@ -3264,13 +3309,15 @@ function deriveOpencodeMessageFingerprint({ msg, totals, source }) {
   return crypto.createHash("sha256").update(raw).digest("base64url").slice(0, 22);
 }
 
-// `fingerprint -> messageKey` for the messages already counted in this cursor
-// namespace. Rebuilt per parse run; entries written before this version carry no
-// fingerprint and simply do not participate (no retroactive rewrite of history).
+// `fingerprint -> messageKey` for counted messages in this cursor namespace.
+// Rebuilt per parse run. Pre-#426 entries are fingerprinted as they are read;
+// the first claims ownership and later cross-session matches are retracted from
+// persisted buckets once. Tombstoned copies never claim ownership themselves.
 function buildOpencodeFingerprintIndex(messageIndex) {
   const byFingerprint = new Map();
   if (!messageIndex || typeof messageIndex !== "object") return byFingerprint;
   for (const [key, entry] of Object.entries(messageIndex)) {
+    if (entry?.dedupedForkCopy === true) continue;
     const fingerprint = entry && typeof entry.fingerprint === "string" ? entry.fingerprint : null;
     if (fingerprint && !byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, key);
   }
@@ -3302,13 +3349,25 @@ function isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey) {
 // cursor untouched. A falsy `fingerprint` means "unknown" and preserves whatever
 // the entry already carried; a new one releases the old claim so a stale
 // mid-stream snapshot cannot shadow an unrelated message later.
-function recordOpencodeMessage({ messageIndex, fingerprintIndex, messageKey, totals, fingerprint }) {
+function recordOpencodeMessage({
+  messageIndex,
+  fingerprintIndex,
+  messageKey,
+  totals,
+  fingerprint,
+  dedupedForkCopy = false,
+}) {
   if (!messageIndex || !messageKey) return;
   const prev = messageIndex[messageKey];
   const prevTotals = prev && typeof prev.lastTotals === "object" ? prev.lastTotals : null;
   const prevFingerprint = prev && typeof prev.fingerprint === "string" ? prev.fingerprint : null;
   const nextFingerprint = fingerprint || prevFingerprint;
-  if (sameGeminiTotals(totals, prevTotals) && prevFingerprint === nextFingerprint) return;
+  const prevDeduped = prev?.dedupedForkCopy === true;
+  if (
+    sameGeminiTotals(totals, prevTotals) &&
+    prevFingerprint === nextFingerprint &&
+    prevDeduped === Boolean(dedupedForkCopy)
+  ) return;
 
   if (fingerprintIndex && prevFingerprint && prevFingerprint !== nextFingerprint) {
     if (fingerprintIndex.get(prevFingerprint) === messageKey) {
@@ -3317,10 +3376,50 @@ function recordOpencodeMessage({ messageIndex, fingerprintIndex, messageKey, tot
   }
   const entry = { lastTotals: totals, updatedAt: new Date().toISOString() };
   if (nextFingerprint) entry.fingerprint = nextFingerprint;
+  if (dedupedForkCopy) entry.dedupedForkCopy = true;
   messageIndex[messageKey] = entry;
-  if (fingerprintIndex && nextFingerprint && !fingerprintIndex.has(nextFingerprint)) {
+  if (
+    fingerprintIndex &&
+    nextFingerprint &&
+    !dedupedForkCopy &&
+    !fingerprintIndex.has(nextFingerprint)
+  ) {
     fingerprintIndex.set(nextFingerprint, messageKey);
   }
+}
+
+function repairCountedOpencodeForkCopy({
+  msg,
+  totals,
+  source,
+  hourlyState,
+  touchedBuckets,
+  projectState,
+  projectTouchedBuckets,
+  projectRef,
+  projectKey,
+}) {
+  const timestampMs = coerceEpochMs(msg?.time?.completed) || coerceEpochMs(msg?.time?.created);
+  if (!timestampMs) return false;
+  const bucketStart = toUtcHalfHourStart(new Date(timestampMs).toISOString());
+  if (!bucketStart) return false;
+  const model = normalizeModelInput(msg?.modelID || msg?.model || msg?.modelId) || DEFAULT_MODEL;
+  const counted = { ...totals, conversation_count: 1 };
+  const bucket = getHourlyBucket(hourlyState, source, model, bucketStart);
+  subtractTotals(bucket.totals, counted);
+  touchedBuckets.add(bucketKey(source, model, bucketStart));
+  if (projectKey && projectState && projectTouchedBuckets) {
+    const projectBucket = getProjectBucket(
+      projectState,
+      projectKey,
+      source,
+      bucketStart,
+      projectRef,
+    );
+    subtractTotals(projectBucket.totals, counted);
+    projectTouchedBuckets.add(projectBucketKey(projectKey, source, bucketStart));
+  }
+  return true;
 }
 
 function getHourlyBucket(state, source, model, hourStart) {
@@ -4378,19 +4477,53 @@ async function parseOpencodeDbIncremental({
       continue;
     }
 
-    // A fork copy of an already-counted turn contributes nothing — skip it
-    // outright so it never claims an index entry of its own (issue #426).
+    // A fork copy of an already-counted turn contributes nothing. Existing
+    // pre-#426 cursor entries were already added to hourly/project buckets;
+    // retract those once, then persist a tombstone so a later sync is a no-op.
     const fingerprint = deriveOpencodeMessageFingerprint({
       msg,
       totals: currentTotals,
       source: defaultSource,
     });
-    if (!lastTotals && isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+    if (isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+      let projectContext = null;
+      if (lastTotals && prev?.dedupedForkCopy !== true && projectEnabled) {
+        projectContext = await resolveProjectContextForDb({
+          msg,
+          dbPath,
+          projectMetaCache,
+          publicRepoCache,
+          publicRepoResolver,
+          projectState,
+        });
+      }
+      if (lastTotals && prev?.dedupedForkCopy !== true) {
+        repairCountedOpencodeForkCopy({
+          msg,
+          totals: lastTotals,
+          source: defaultSource,
+          hourlyState,
+          touchedBuckets,
+          projectState,
+          projectTouchedBuckets,
+          projectRef: projectContext?.projectRef || null,
+          projectKey: projectContext?.projectKey || null,
+        });
+      }
+      recordOpencodeMessage({
+        messageIndex,
+        fingerprintIndex,
+        messageKey,
+        totals: currentTotals,
+        fingerprint,
+        dedupedForkCopy: true,
+      });
       messagesProcessed += 1;
       continue;
     }
 
-    const delta = diffGeminiTotals(currentTotals, lastTotals);
+    const effectiveLastTotals = prev?.dedupedForkCopy === true ? null : lastTotals;
+    const delta = diffGeminiTotals(currentTotals, effectiveLastTotals);
     if (!delta || isAllZeroUsage(delta)) {
       // Refresh the index even without a delta: normalization may have changed,
       // and pre-#426 entries need their fingerprint backfilled so a fork taken
@@ -4401,6 +4534,7 @@ async function parseOpencodeDbIncremental({
         messageKey,
         totals: currentTotals,
         fingerprint,
+        dedupedForkCopy: false,
       });
       messagesProcessed += 1;
       if (cb) {
@@ -4464,6 +4598,7 @@ async function parseOpencodeDbIncremental({
       messageKey,
       totals: currentTotals,
       fingerprint,
+      dedupedForkCopy: false,
     });
     messagesProcessed += 1;
     eventsAggregated += 1;
@@ -16008,6 +16143,130 @@ function isCjkCodePoint(code) {
   );
 }
 
+// ── Trae SOLO (ByteDance AI IDE) ─────────────────────────────────────────────
+// https://www.trae.ai
+//
+// Trae SOLO is scoped to detection (init) + entitlement display (status):
+//   - init: resolveTraeStoragePath() proves an install exists.
+//   - status: readTraeEntitlementFromStorage() serves the plan/limits snapshot.
+// Trae SOLO does NOT expose per-request token usage in a readable local format
+// (session transcripts are SQLCipher-encrypted; memory summaries carry no
+// token counts), so the token-count-only queue is intentionally never written
+// for this provider — the cloud hourly table stays clean.
+function resolveTraePath(env = process.env) {
+  const override = env.TOKENTRACKER_TRAE_HOME;
+  if (typeof override === "string" && override.trim().length > 0) {
+    return override.trim();
+  }
+  const home = require("node:os").homedir();
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Application Support", "TRAE SOLO");
+  }
+  if (process.platform === "win32") {
+    // A Windows box with no APPDATA still keeps Trae under the standard
+    // roaming profile — falling through to the dot-dir below would point at
+    // a location Trae never writes.
+    const appData = typeof env.APPDATA === "string" ? env.APPDATA.trim() : "";
+    return appData
+      ? path.join(appData, "TRAE SOLO")
+      : path.join(home, "AppData", "Roaming", "TRAE SOLO");
+  }
+  // Linux and friends: TRAE SOLO ships official builds for macOS/Windows
+  // only, so there is no verified app-data layout to default to. Fall back to
+  // a deterministic home-dir path (best-effort detection);
+  // TOKENTRACKER_TRAE_HOME always wins for unusual installs.
+  return path.join(home, ".trae-solo");
+}
+
+function resolveTraeStoragePath(env = process.env) {
+  const traHome = resolveTraePath(env);
+  if (!traHome) return null;
+  const p = path.join(traHome, "User", "globalStorage", "storage.json");
+  return fssync.existsSync(p) ? p : null;
+}
+
+/**
+ * Extract the Trae SOLO entitlement snapshot from parsed storage.json
+ * serverData (the value under iCubeServerData://icube.cloudide).
+ * Returns a normalized entitlement object, or null when the serverData
+ * carries no valid entitlementInfo. Shared by the status read path
+ * (readTraeEntitlementFromStorage).
+ */
+function normalizeTraeEntitlement(serverData) {
+  let ent;
+  try {
+    ent = typeof serverData === "string" ? JSON.parse(serverData) : serverData;
+  } catch {
+    return null;
+  }
+  // The parsed serverData may legitimately be JSON `null` (e.g. the string
+  // "null") or another non-object — treat it as no valid snapshot.
+  if (!ent || typeof ent !== "object" || Array.isArray(ent)) return null;
+  const entitlementInfo = ent.entitlementInfo;
+  if (!entitlementInfo || typeof entitlementInfo !== "object") return null;
+  const detail = entitlementInfo.detail || {};
+  return {
+    identity: entitlementInfo.identityStr,
+    identity_code: entitlementInfo.identity,
+    has_package: entitlementInfo.hasPackage,
+    is_dollar_billing: entitlementInfo.isDollarUsageBilling,
+    pro_period: entitlementInfo.proPeriod,
+    enable_solo_builder: entitlementInfo.enableSoloBuilder,
+    enable_solo_coder: entitlementInfo.enableSoloCoder,
+    fast_request_per: detail.fastRequestPer,
+    in_waitlist: detail.inWaitlist,
+  };
+}
+
+/**
+ * Read the current Trae SOLO entitlement snapshot straight from the Trae
+ * Local State storage.json, without touching the token-count-only queue
+ * (CLAUDE.md privacy contract). Returns a normalized entitlement object
+ * with a captured_at timestamp, or null when storage.json is missing,
+ * unparseable, or carries no valid entitlement snapshot.
+ */
+function readTraeEntitlementFromStorage(storagePath) {
+  if (!storagePath) return null;
+  let fd;
+  try {
+    fd = fssync.openSync(storagePath, "r");
+  } catch {
+    return null;
+  }
+  let stat = null;
+  let raw;
+  try {
+    stat = fssync.fstatSync(fd);
+    raw = fssync.readFileSync(fd, "utf8");
+  } catch {
+    return null;
+  } finally {
+    try {
+      fssync.closeSync(fd);
+    } catch {
+      // fd already closed; nothing to do.
+    }
+  }
+  let storage;
+  try {
+    storage = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!storage || typeof storage !== "object" || Array.isArray(storage)) {
+    return null;
+  }
+  const serverKey = "iCubeServerData://icube.cloudide";
+  const serverData = storage[serverKey];
+  if (!serverData) return null;
+  const entitlement = normalizeTraeEntitlement(serverData);
+  if (!entitlement) return null;
+  return {
+    ...entitlement,
+    captured_at: stat ? new Date(stat.mtimeMs).toISOString() : null,
+  };
+}
+
 module.exports = {
   listRolloutFiles,
   listRolloutFilesDeep,
@@ -16175,4 +16434,9 @@ module.exports = {
   parseAntigravityIncremental,
   estimateAntigravityTokens,
   isCjkCodePoint,
+
+  // Trae SOLO (ByteDance AI IDE)
+  resolveTraePath,
+  resolveTraeStoragePath,
+  readTraeEntitlementFromStorage,
 };

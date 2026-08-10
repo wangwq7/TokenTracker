@@ -310,6 +310,10 @@ internal sealed class ServerManager : IDisposable
         psi.Environment["NODE_ENV"] = "production";
         psi.Environment["TOKENTRACKER_APP_SHELL"] = "windows";
 
+        var proxySource = ChildProcessProxy.Configure(psi.Environment, HttpClient.DefaultProxy);
+        if (proxySource != ChildProcessProxySource.None)
+            Log($"node child proxy source={proxySource}");
+
         Log($"StartTrackerProcess file={nodePath} entry={entryPath} args={string.Join(" ", args)}");
         var proc = Process.Start(psi);
         // Drain pipes so the child never blocks on a full stdout/stderr buffer.

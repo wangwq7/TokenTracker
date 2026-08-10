@@ -407,13 +407,24 @@ internal sealed class PetWindow : Window
                 // let the inside/outside result flip against the animating edge and re-
                 // toggle _isRevealed, cancelling and restarting the slide — the retract
                 // stutter. Using _isRevealed as the reference gives stable hysteresis:
-                // tucked → only the peek strip is "inside"; revealed → the full sprite is.
+                // tucked → only the peek strip is "inside"; revealed → the whole slid-out
+                // band up to the screen edge is.
                 var wa = SystemParameters.WorkArea;
                 double targetLeft = _isRevealed ? wa.Right - Width : TuckedLeft(wa.Right);
                 double leftX = targetLeft + SpriteLeftInset - pad;
-                double spriteRight = targetLeft + SpriteLeftInset + SpriteSize + pad;
                 double rightLimit = wa.Right + EdgeTolerance; // cursor clamps at the screen edge
-                inside = p.X >= leftX && p.X < Math.Min(spriteRight, rightLimit)
+                // Both states must share the border strip, or the hysteresis above has no
+                // dead zone. Capping the revealed state at spriteRight looks right but is
+                // not: the sprite is centred in a 400px window, so its right edge sits
+                // ~137px inside the screen edge. A cursor parked on the border was then
+                // "inside" while tucked (that region runs to rightLimit) and "outside"
+                // once revealed — reveal, tuck, reveal, every 150ms hover tick, with
+                // _isAnimating stuck true so ClickThroughTick never restored
+                // WS_EX_TRANSPARENT and the pet could not be grabbed (#434). Running the
+                // revealed region to the same rightLimit makes it a superset of the
+                // tucked one: hovering the border keeps the pet out, and it tucks only
+                // when the cursor leaves the sprite band.
+                inside = p.X >= leftX && p.X < rightLimit
                     && p.Y >= spriteTop && p.Y < spriteBottom;
             }
             else

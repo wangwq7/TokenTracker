@@ -277,6 +277,46 @@ test("Windows edge tuck keeps the sprite visible instead of hiding window paddin
   }
 });
 
+test("Windows docked pet: both hover states reach the screen edge (#434)", () => {
+  // A cursor parked on the screen border used to flip _isRevealed on every
+  // 150ms tick: the tucked region ran to rightLimit (the border) while the
+  // revealed one was capped at the sprite's right edge, ~137px inside it. The
+  // two regions never overlapped, so there was no hysteresis dead zone — the
+  // pet oscillated and _isAnimating stayed true, which made ClickThroughTick
+  // bail and left the pet ungrabbable.
+  const miniBranch = windowsPetSource.match(/if \(_miniMode\)\s*\{[\s\S]*?\n {12}\}/)?.[0];
+  assert.ok(miniBranch, "mini-mode hover branch must stay recognizable");
+  assert.match(miniBranch, /inside = p\.X >= leftX && p\.X < rightLimit/);
+  assert.doesNotMatch(
+    miniBranch,
+    /Math\.Min\(spriteRight, rightLimit\)/,
+    "capping the revealed hover region at the sprite edge reopens #434",
+  );
+
+  // The property that actually matters: revealed ⊇ tucked, for every preset.
+  const edgePeek = 30;
+  const edgeTolerance = 4;
+  const workAreaRight = 1920;
+  for (const [width, height] of [[400, 230], [400, 254], [400, 286]]) {
+    const spriteSize = Math.max(40, Math.min(width, height - 138) - 8);
+    const inset = (width - spriteSize) / 2;
+    const pad = Math.max(8, spriteSize * 0.08);
+    const rightLimit = workAreaRight + edgeTolerance;
+
+    const revealed = [workAreaRight - width + inset - pad, rightLimit];
+    const tucked = [workAreaRight - inset - edgePeek + inset - pad, rightLimit];
+
+    assert.ok(
+      revealed[0] <= tucked[0] && revealed[1] >= tucked[1],
+      `revealed hover region must contain the tucked one (h=${height})`,
+    );
+    // The border cursor — the exact position that used to oscillate.
+    const borderX = workAreaRight - 1;
+    const inSpan = ([lo, hi]) => borderX >= lo && borderX < hi;
+    assert.ok(inSpan(tucked) && inSpan(revealed), `border cursor must be inside in both states (h=${height})`);
+  }
+});
+
 test("Windows edge snap ignores the transparent bubble padding", () => {
   assert.match(windowsPetSource, /private double SpriteRight\(double windowLeft\)/);
   assert.match(windowsPetSource, /if \(SpriteRight\(x\) >= wa\.Right - SnapMargin\)/);

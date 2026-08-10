@@ -65,6 +65,7 @@ const {
   resolveOmpAgentDir,
   resolvePiAgentDirs,
   resolveAnythingllmDbPath,
+  resolveTraeStoragePath,
 } = require("../lib/rollout");
 const { resolveRuntimeConfig, DEFAULT_BASE_URL } = require("../lib/runtime-config");
 const {
@@ -708,6 +709,21 @@ async function applyIntegrationSetup({
     const craftConfigDir = process.env.CRAFT_CONFIG_DIR || path.join(home, ".craft-agent");
     if (fssync.existsSync(craftConfigDir)) {
       summary.push({ label: "Craft Agents", status: "detected", detail: "Passive reader (no hook needed)" });
+    }
+  }
+
+  // Trae SOLO (ByteDance AI IDE): plan snapshot only. Trae keeps its session
+  // transcripts SQLCipher-encrypted and its plaintext summaries hold no token
+  // counts, so there is no usage to read — the detail line must not promise
+  // otherwise ("Passive reader" reads, everywhere else, as "tokens counted").
+  {
+    const traeStoragePath = resolveTraeStoragePath(process.env);
+    if (traeStoragePath) {
+      summary.push({
+        label: "Trae SOLO",
+        status: "detected",
+        detail: "Plan info only — Trae exposes no readable token usage",
+      });
     }
   }
 

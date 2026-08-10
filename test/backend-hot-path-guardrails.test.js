@@ -184,7 +184,7 @@ test("leaderboard refresh reconciles stale rows after the replacement snapshot i
   );
 });
 
-test("leaderboard anti-cheat health poll is hourly and never files public issues", () => {
+test("leaderboard anti-cheat workflow actively scans, refreshes, and never leaks identities", () => {
   const workflow = read(".github/workflows/leaderboard-anticheat.yml");
   assert.match(
     workflow,
@@ -196,11 +196,77 @@ test("leaderboard anti-cheat health poll is hourly and never files public issues
     /issues:\s*write|gh issue (?:create|edit|close|list)/u,
     "automatic soft exclusion must not depend on or create a public GitHub issue",
   );
+  assert.match(workflow, /secrets\.LEADERBOARD_REFRESH_SECRET/u);
+  assert.match(workflow, /"scan_anomalies":true/u);
+  assert.match(workflow, /"force_refresh":true/u);
+  assert.match(workflow, /--retry 2 --retry-delay 3 --retry-max-time 90 --retry-all-errors/u,
+    "the remote scan must absorb one transient edge/database timeout");
+  assert.match(workflow, /for period in month total/u);
+  assert.match(workflow, /\?anomalies=1/u, "the workflow must independently read back queue state");
+  assert.doesNotMatch(workflow, /user_id/u, "workflow logs must never expose flagged identities");
   assert.match(
     workflow,
     /GITHUB_STEP_SUMMARY/u,
     "the health check should retain private run-level observability",
   );
+});
+
+test("privileged anti-cheat scans run before forced snapshot refresh", () => {
+  const source = read("dashboard/edge-patches/tokentracker-leaderboard-refresh.ts");
+  const authorizationGuard = source.indexOf('authorization !== "privileged"');
+  const detectorCall = source.indexOf('"detect_leaderboard_anomalies"');
+  const periodLoop = source.indexOf("for (const period of periods)");
+
+  assert.ok(authorizationGuard > 0 && authorizationGuard < detectorCall,
+    "scan and force flags must be privileged before the detector RPC runs");
+  assert.ok(detectorCall < periodLoop,
+    "the detector must finish before snapshots are rebuilt");
+  assert.match(source, /p_min_interval_s: forceRefresh \? 0 : 30/u,
+    "an authenticated response run must not lose to an unrelated refresh throttle");
+  assert.match(source, /timeout: 25_000/u,
+    "the bounded detector must have enough client timeout headroom to finish under load");
+  assert.match(source, /return json\(\{ ok: true, results, \.\.\.\(anomalyScan \? \{ scan: anomalyScan \} : \{\}\) \}\)/u);
+});
+
+test("leaderboard bans block token issuance and usage ingestion", () => {
+  const tokenIssue = read("dashboard/edge-patches/tokentracker-device-token-issue.ts");
+  const devicePoll = read("dashboard/edge-patches/tokentracker-device-flow-poll.ts");
+  const ingest = read("dashboard/edge-patches/tokentracker-ingest.ts");
+
+  for (const [file, source] of [
+    ["tokentracker-device-token-issue.ts", tokenIssue],
+    ["tokentracker-device-flow-poll.ts", devicePoll],
+    ["tokentracker-ingest.ts", ingest],
+  ]) {
+    assert.match(source, /Deno\.env\.get\("LEADERBOARD_BLOCKED_USER_IDS"\)/u,
+      `${file} must read the production account blocklist`);
+    assert.match(source, /return json\(\{ error: "Account blocked" \}, 403\)/u,
+      `${file} must reject blocked accounts`);
+  }
+
+  assert.ok(
+    tokenIssue.indexOf("if (await isUsageBlocked(dbClient, userId))")
+      < tokenIssue.indexOf("// Device identity resolution"),
+    "normal token issuance must reject the account before mutating a device",
+  );
+  assert.ok(
+    devicePoll.indexOf("if (await isUsageBlocked(client, row.user_id))")
+      < devicePoll.indexOf("issueDeviceToken(client, row.user_id"),
+    "device-flow polling must reject the account before issuing a token",
+  );
+  assert.ok(
+    ingest.indexOf("if (await isUsageBlocked(client, userId))")
+      < ingest.indexOf('.from("tokentracker_hourly")'),
+    "ingest must reject the account before writing usage",
+  );
+  for (const [file, source] of [
+    ["tokentracker-device-token-issue.ts", tokenIssue],
+    ["tokentracker-device-flow-poll.ts", devicePoll],
+    ["tokentracker-ingest.ts", ingest],
+  ]) {
+    assert.match(source, /\.eq\("status", "auto_excluded"\)/u,
+      `${file} must reversibly pause machine-excluded accounts`);
+  }
 });
 
 test("leaderboard reads expose snapshot freshness and disable response caching", () => {

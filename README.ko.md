@@ -39,7 +39,7 @@
 
 ## ⚡ 빠른 시작
 
-> **요구 사항**: Node.js **20+** (CLI는 macOS / Linux / Windows에서 동작; 네이티브 데스크톱 앱은 macOS(메뉴바)와 Windows(시스템 트레이) 모두 제공. Cursor 토큰 읽기는 가능한 경우 시스템 `sqlite3` CLI를 사용하고, 지원되는 Node 릴리스에서는 `node:sqlite`로 폴백).
+> **요구 사항**: Node.js **20+** (CLI는 macOS / Linux / Windows에서 동작; 네이티브 데스크톱 앱은 macOS(메뉴바), Windows(시스템 트레이), Linux(AppImage, 트레이) 제공. Cursor 토큰 읽기는 가능한 경우 시스템 `sqlite3` CLI를 사용하고, 지원되는 Node 릴리스에서는 `node:sqlite`로 폴백).
 
 ```bash
 npx tokentracker-cli
@@ -56,6 +56,7 @@ npx tokentracker-cli
 > **네이티브 데스크톱 앱이 필요하다면?**
 > - **macOS** — [`TokenTrackerBar.dmg` 다운로드](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTrackerBar.dmg) → Applications로 드래그. 데스크톱 위젯, 메뉴바 상태 아이콘, WKWebView 안의 동일한 대시보드를 포함합니다.
 > - **Windows** — [`TokenTracker-Setup.exe` 다운로드](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-Setup.exe) → 관리자 권한이 필요 없는 사용자 단위 설치 프로그램 실행. WebView2 안에 대시보드를 표시하는 시스템 트레이 앱입니다. 포터블 zip은 [릴리스 페이지](https://github.com/xiufengsun/TokenTracker/releases/latest)에 있습니다.
+> - **Linux** — [`TokenTracker-linux-x86_64.AppImage` 다운로드](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-linux-x86_64.AppImage) → `chmod +x` 후 실행. WebKitGTK 창에 대시보드를 표시하는 트레이 앱입니다. 배포판의 `webkit2gtk-4.1`, `gtk3`, `libayatana-appindicator`가 필요하며 GNOME에서는 트레이 아이콘에 [AppIndicator 확장](https://extensions.gnome.org/extension/615/appindicator-support/)도 필요합니다.
 
 짧은 명령어로 쓰려면 전역 설치:
 

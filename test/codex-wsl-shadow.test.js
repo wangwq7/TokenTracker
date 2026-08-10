@@ -17,6 +17,22 @@ const { mockPlatform, mockMethod } = require("./helpers/mock");
 // (union) regardless of mode, double-counting and leaking native usage into
 // wsl-only mode.
 //
+// Since #27 the preference modes DO scan both installs, on purpose: a
+// populated WSL install used to evict the native one outright, so a user with
+// Codex on both sides saw those sessions in the session browser while the
+// dashboard counted none of their tokens. `wsl-first` / `native-first` now
+// order the roots rather than delete one. What the earlier regression got
+// wrong is still enforced below: the *-only modes stay exclusive (no native
+// leak into wsl-only), an empty WSL shell still cannot shadow native, a second
+// sync stays a no-op, and the same session reachable under both roots must
+// collapse instead of double-counting.
+//
+// Session UUIDs here are real v4-shaped UUIDs on purpose. The parser's Codex
+// event dedup keys on `sessionUUID:eventTimestamp` and falls back to the file
+// path when the name does not match codexSessionIdFromPath's UUID regex — with
+// the placeholder names this file used before, the cross-root dedup silently
+// degraded to per-path and the union cases proved nothing.
+//
 // Hermeticity design (passes identically on any host OS, with any real home):
 // - process.platform is mocked to "win32" so the win32 resolver branches run
 //   everywhere (Object.defineProperty, restored in teardown).
@@ -93,6 +109,8 @@ async function withIsolatedEnv(fn) {
 
 const NATIVE_TOKENS = 120;
 const WSL_TOKENS = 240;
+const NATIVE_UUID = "11111111-2222-4333-8444-555555555555";
+const WSL_UUID = "99999999-8888-4777-8666-555555555555";
 
 async function writeCodexRollout(codexHome, date, uuid, totalTokens) {
   const [year, month, day] = date.split("-");
@@ -136,18 +154,25 @@ async function readQueue(queuePath) {
 }
 
 // Distinct native (120) vs WSL (240) totals make "which install was scanned"
-// directly assertable from the queue sum: a union scan yields 360, a native
-// leak into wsl-only yields 120 where 0 is expected.
+// directly assertable from the queue sum: both installs yield 360, a native
+// leak into wsl-only yields 120 where 0 is expected, and a dropped install
+// yields whichever single total survived.
 const CASES = [
   { name: "wsl-first falls back to the native install when no WSL home exists", mode: "wsl-first", wsl: "missing", expected: NATIVE_TOKENS },
   { name: "wsl-first falls back past an empty WSL ~/.codex shell (the reported bug)", mode: "wsl-first", wsl: "empty", expected: NATIVE_TOKENS, runTwice: true },
-  { name: "wsl-first prefers a populated WSL install without union-scanning native", mode: "wsl-first", wsl: "populated", expected: WSL_TOKENS },
+  { name: "wsl-first counts a populated WSL install WITHOUT dropping native (#27)", mode: "wsl-first", wsl: "populated", expected: NATIVE_TOKENS + WSL_TOKENS, runTwice: true },
   { name: "auto (unset) falls back past an empty WSL ~/.codex shell", mode: null, wsl: "empty", expected: NATIVE_TOKENS },
-  { name: "auto (unset) prefers a populated WSL install without union-scanning native", mode: null, wsl: "populated", expected: WSL_TOKENS },
+  { name: "auto (unset) counts a populated WSL install WITHOUT dropping native (#27)", mode: null, wsl: "populated", expected: NATIVE_TOKENS + WSL_TOKENS },
+  { name: "native-first counts a populated WSL install WITHOUT dropping it", mode: "native-first", wsl: "populated", expected: NATIVE_TOKENS + WSL_TOKENS },
   { name: "wsl-only scans nothing when no WSL home exists (no native leak)", mode: "wsl-only", wsl: "missing", expected: 0 },
   { name: "wsl-only scans nothing when the WSL ~/.codex shell is empty (no native leak)", mode: "wsl-only", wsl: "empty", expected: 0 },
   { name: "wsl-only scans only the populated WSL install", mode: "wsl-only", wsl: "populated", expected: WSL_TOKENS, runTwice: true },
+  { name: "native-only ignores a populated WSL install", mode: "native-only", wsl: "populated", expected: NATIVE_TOKENS },
   { name: "both scans native and WSL installs", mode: "both", wsl: "populated", expected: NATIVE_TOKENS + WSL_TOKENS },
+  // The union's load-bearing safety property: one WSL $HOME mounted on the
+  // Windows profile makes the SAME session reachable under both roots. It must
+  // be counted once, not twice.
+  { name: "the same session reachable under both roots is counted once, not twice", mode: "wsl-first", wsl: "populated", sameSessionAsNative: true, expected: NATIVE_TOKENS, runTwice: true },
 ];
 
 for (const kase of CASES) {
@@ -162,15 +187,22 @@ for (const kase of CASES) {
 
       // Native (Windows) codex install, always populated.
       const nativeCodex = path.join(home, ".codex");
-      await writeCodexRollout(nativeCodex, "2026-07-31", "test-uuid-native", NATIVE_TOKENS);
+      await writeCodexRollout(nativeCodex, "2026-07-31", NATIVE_UUID, NATIVE_TOKENS);
 
       // Fake WSL distro home in one of three states: missing (no dir, mock
       // returns null), empty shell (dir exists, no sessions/), or populated.
+      // `sameSessionAsNative` writes a byte-identical copy of the native
+      // session instead of a distinct one — the shared-$HOME case.
       const wslCodex = path.join(home, "wsl-home", ".codex");
       if (kase.wsl === "empty") {
         await fs.mkdir(wslCodex, { recursive: true });
       } else if (kase.wsl === "populated") {
-        await writeCodexRollout(wslCodex, "2026-07-31", "test-uuid-wsl", WSL_TOKENS);
+        await writeCodexRollout(
+          wslCodex,
+          "2026-07-31",
+          kase.sameSessionAsNative ? NATIVE_UUID : WSL_UUID,
+          kase.sameSessionAsNative ? NATIVE_TOKENS : WSL_TOKENS,
+        );
       }
 
       mockMethod(t, wsl, "discoverWslHome", (providerDir) =>

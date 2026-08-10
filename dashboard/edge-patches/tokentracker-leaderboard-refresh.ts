@@ -509,30 +509,34 @@ function newUserAgg(): UserAgg {
 }
 
 /**
- * GET ?anomalies=1 — anti-cheat queue health, for the credential-free GitHub
- * Actions watchdog (.github/workflows/leaderboard-anticheat.yml).
+ * GET ?anomalies=1 — counts-only anti-cheat queue health and independent
+ * read-back for the GitHub Actions scanner.
  *
- * Returns COUNTS ONLY, never user_ids. The watchdog files a public GitHub issue
- * with whatever it receives, and naming a flagged account in public before a
- * human has reviewed it would accuse users the detector may yet clear. The
- * operator pulls identities from the flags table directly (queries at the
- * bottom of scripts/ops/leaderboard-anomaly-detection.sql).
+ * Returns COUNTS ONLY, never user_ids. Naming a flagged account in a public CI
+ * log before human review would accuse users the detector may yet clear. The
+ * operator pulls identities from the private flags table directly.
  */
-async function anomalyQueueSummary(
+async function anomalyQueueSummaryData(
   client: ReturnType<typeof createClient>,
-): Promise<Response> {
+): Promise<{
+  ok: true;
+  auto_excluded: number;
+  review: number;
+  max_peak_tokens: number;
+  latest_detected_at: string | null;
+}> {
   const { data, error } = await client.database
     .from("tokentracker_leaderboard_anomaly_flags")
     .select("status,peak_tokens,detected_at")
     .in("status", ["auto_excluded", "review"]);
-  if (error) return json({ error: error.message }, 500);
+  if (error) throw new Error(error.message);
   const rows = (Array.isArray(data) ? data : []) as Array<{
     status: string;
     peak_tokens: number;
     detected_at: string;
   }>;
   const pick = (s: string) => rows.filter((r) => r.status === s);
-  return json({
+  return {
     ok: true,
     auto_excluded: pick("auto_excluded").length,
     review: pick("review").length,
@@ -542,7 +546,17 @@ async function anomalyQueueSummary(
     ),
     latest_detected_at:
       rows.map((r) => r.detected_at).sort().at(-1) ?? null,
-  });
+  };
+}
+
+async function anomalyQueueSummary(
+  client: ReturnType<typeof createClient>,
+): Promise<Response> {
+  try {
+    return json(await anomalyQueueSummaryData(client));
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
 }
 
 export default async function (req: Request): Promise<Response> {
@@ -573,6 +587,11 @@ export default async function (req: Request): Promise<Response> {
     baseUrl,
     edgeFunctionToken: serviceRoleKey,
     anonKey,
+    // The protected anomaly RPC performs a bounded multi-day aggregate and
+    // can legitimately cross the SDK's older 10s default under load. Keep the
+    // timeout below the edge runtime budget while leaving enough headroom for
+    // the scan to complete instead of reporting a false automation failure.
+    timeout: 25_000,
     ...(anonKey ? { headers: { apikey: anonKey } } : {}),
   });
 
@@ -580,8 +599,42 @@ export default async function (req: Request): Promise<Response> {
 
   // Parse requested periods
   const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  const scanAnomalies = body.scan_anomalies === true;
+  const forceRefresh = body.force_refresh === true;
+  if ((scanAnomalies || forceRefresh) && authorization !== "privileged")
+    return json({ error: "privileged anti-cheat operation required" }, 403);
   if (authorization === "signed-in" && body.period !== "week")
     return json({ error: "signed-in users may only refresh week" }, 403);
+
+  let anomalyScan: {
+    inserted_excluded: number;
+    inserted_review: number;
+    breaker_tripped: boolean;
+    queue: Awaited<ReturnType<typeof anomalyQueueSummaryData>>;
+  } | null = null;
+  if (scanAnomalies) {
+    const { data: scanData, error: scanError } = await client.database.rpc(
+      "detect_leaderboard_anomalies",
+    );
+    if (scanError) {
+      logRefreshEvent({ event: "anomaly_scan_failed", error: scanError.message });
+      return json({ error: scanError.message }, 500);
+    }
+    const scanRow = Array.isArray(scanData) && scanData.length > 0
+      ? scanData[0] as Record<string, unknown>
+      : {};
+    try {
+      anomalyScan = {
+        inserted_excluded: Number(scanRow.inserted_excluded) || 0,
+        inserted_review: Number(scanRow.inserted_review) || 0,
+        breaker_tripped: scanRow.breaker_tripped === true,
+        queue: await anomalyQueueSummaryData(client),
+      };
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+    logRefreshEvent({ event: "anomaly_scan_completed", ...anomalyScan });
+  }
   const requestSource =
     typeof body.source === "string" && body.source.trim().length > 0
       ? body.source.trim().slice(0, 80)
@@ -612,7 +665,7 @@ export default async function (req: Request): Promise<Response> {
     try {
       const { data: claimed, error: claimErr } = await client.database.rpc(
         "leaderboard_refresh_try_claim",
-        { p_period: period, p_min_interval_s: 30 },
+        { p_period: period, p_min_interval_s: forceRefresh ? 0 : 30 },
       );
       if (!claimErr && claimed !== true) {
         results[period] = { upserted: 0, skipped: true };
@@ -975,5 +1028,5 @@ export default async function (req: Request): Promise<Response> {
     duration_ms: Date.now() - requestStartedAt,
     results,
   });
-  return json({ ok: true, results });
+  return json({ ok: true, results, ...(anomalyScan ? { scan: anomalyScan } : {}) });
 }

@@ -71,6 +71,8 @@ const {
   resolveGooseDbPath,
   listDroidSettingsFiles,
   resolveDroidSessionsDir,
+  resolveTraeStoragePath,
+  readTraeEntitlementFromStorage,
   resolveGrokBuildSessions,
   resolveHermesPath,
   resolveHermesDbPath,
@@ -87,17 +89,55 @@ const { resolveCindyAgentHomes, pathIdentity } = require("../lib/cindy-paths");
 const { probeGrokHookState, resolveGrokHome } = require("../lib/grok-hook");
 const { probeOmpHookState } = require("../lib/omp-hook");
 
+// `filename` may be a list, in which case the first child that exists wins. A
+// resolver using requireAnyChild accepts a root that holds ANY of several
+// children, so probing only the first one here would report "not detected" for
+// an install sync happily counts (e.g. Codex with archived_sessions/ but no
+// live sessions/).
 function formatResolvedPaths(paths, filename) {
+  const candidates = filename == null ? [] : (Array.isArray(filename) ? filename : [filename]);
+  const resolveFile = (root) => {
+    if (candidates.length === 0) return root;
+    for (const candidate of candidates) {
+      const file = path.join(root, candidate);
+      try { if (fssync.existsSync(file)) return file; } catch (_e) {}
+    }
+    return null;
+  };
   const active = [];
-  if (paths.native) {
-    const file = filename ? path.join(paths.native, filename) : paths.native;
-    try { if (fssync.existsSync(file)) active.push(`native: ${file}`); } catch (_e) {}
-  }
-  if (paths.wsl) {
-    const file = filename ? path.join(paths.wsl, filename) : paths.wsl;
-    try { if (fssync.existsSync(file)) active.push(`WSL: ${file}`); } catch (_e) {}
+  for (const [label, root] of [["native", paths.native], ["WSL", paths.wsl]]) {
+    if (!root) continue;
+    const file = resolveFile(root);
+    if (!file) continue;
+    try { if (fssync.existsSync(file)) active.push(`${label}: ${file}`); } catch (_e) {}
   }
   return active;
+}
+
+// The Trae SOLO entitlement snapshot is read directly from the Trae Local
+// State storage.json via the shared parser (readTraeEntitlementFromStorage).
+// The queue.jsonl contract is token-count-only (CLAUDE.md privacy rule), so
+// plan/limits metadata is never persisted into queue rows — this is the read
+// side of that contract so users can actually see the advertised plan data.
+function formatTraeEntitlementLine(ent) {
+  const parts = [];
+  if (ent.identity) parts.push(`plan ${ent.identity}`);
+  if (ent.pro_period) parts.push(`${ent.pro_period} period`);
+  if (typeof ent.is_dollar_billing === "boolean") {
+    parts.push(ent.is_dollar_billing ? "dollar billing" : "package billing");
+  }
+  if (typeof ent.enable_solo_builder === "boolean") {
+    parts.push(`solo builder: ${ent.enable_solo_builder ? "yes" : "no"}`);
+  }
+  if (typeof ent.enable_solo_coder === "boolean") {
+    parts.push(`solo coder: ${ent.enable_solo_coder ? "yes" : "no"}`);
+  }
+  if (typeof ent.fast_request_per === "number") {
+    parts.push(`${ent.fast_request_per} fast requests/hr`);
+  }
+  if (ent.in_waitlist === true) parts.push("in waitlist");
+  if (ent.captured_at) parts.push(`snapshot ${ent.captured_at}`);
+  return parts.length ? parts.join(", ") : "unknown";
 }
 
 async function cmdStatus(argv = []) {
@@ -542,10 +582,15 @@ async function cmdStatus(argv = []) {
   }
   const antigravityInstalled = antigravityActive.length > 0;
 
-  // Codex CLI (passive sessions scan)
+  // Codex CLI (passive sessions scan). Mirrors the sync resolution exactly
+  // (union + requireAnyChild, see src/commands/sync.js): status is the tool
+  // users are asked to paste when Codex usage looks wrong, so it must list
+  // every root sync actually walks — and no empty shell sync would skip.
   const codexPaths = resolveInstallPaths({
     nativeValue: process.env.CODEX_HOME || path.join(home, ".codex"),
     wslDir: ".codex",
+    requireAnyChild: ["sessions", "archived_sessions"],
+    union: true,
   });
   const cindyCodexHomes = process.platform !== "win32" || wsl.shouldProbeNative(process.env)
     ? resolveCindyAgentHomes("codex", { env: process.env, home })
@@ -575,10 +620,15 @@ async function cmdStatus(argv = []) {
     const key = pathIdentity(dir);
     if (seenCodexHomes.has(key)) continue;
     seenCodexHomes.add(key);
-    const sessions = path.join(dir, "sessions");
-    try {
-      if (fssync.existsSync(sessions)) codexActive.push(`${label}: ${sessions}`);
-    } catch (_e) { }
+    for (const child of ["sessions", "archived_sessions"]) {
+      const candidate = path.join(dir, child);
+      try {
+        if (fssync.existsSync(candidate)) {
+          codexActive.push(`${label}: ${candidate}`);
+          break;
+        }
+      } catch (_e) { }
+    }
   }
   const codexInstalledStatus = codexActive.length > 0;
 
@@ -618,6 +668,17 @@ async function cmdStatus(argv = []) {
   const droidSessionsDir = resolveDroidSessionsDir(process.env);
   const droidSettingsFiles = listDroidSettingsFiles(process.env);
   const droidInstalled = droidSettingsFiles.length > 0;
+
+  // Trae SOLO (ByteDance AI IDE) — passive entitlement snapshot reader.
+  const traeStoragePath = resolveTraeStoragePath(process.env);
+  const traeInstalled = Boolean(traeStoragePath);
+  // Render path for the entitlement snapshot: read it straight from the
+  // Trae Local State storage.json via the shared parser. The queue stays
+  // token-count-only, so the status read path never depends on queue rows
+  // carrying plan/limits metadata.
+  const traeEntitlement = traeInstalled
+    ? readTraeEntitlementFromStorage(traeStoragePath)
+    : null;
 
   // Grok Build (xAI TUI)
   const grokHookState = await probeGrokHookState({ home, trackerDir, env: process.env });
@@ -894,6 +955,13 @@ async function cmdStatus(argv = []) {
         droid: droidInstalled
           ? { installed: true, files: droidSettingsFiles.length, detail: droidSessionsDir }
           : { installed: false },
+        trae: traeInstalled
+          ? {
+              installed: true,
+              detail: traeStoragePath,
+              ...(traeEntitlement ? { entitlement: traeEntitlement } : {}),
+            }
+          : { installed: false },
         grok_build: grokInstalled
           ? {
               installed: true,
@@ -1045,6 +1113,17 @@ async function cmdStatus(argv = []) {
         : null,
       droidInstalled
         ? `- Droid (Factory): passive reader (${droidSettingsFiles.length} session${droidSettingsFiles.length !== 1 ? "s" : ""} in ${droidSessionsDir}, cumulative-delta)`
+        : null,
+      traeInstalled
+        // Deliberately NOT "passive reader": every other line with that wording
+        // means tokens are being counted. Trae encrypts its session transcripts
+        // (SQLCipher) and its plaintext summaries carry no token counts, so this
+        // provider contributes plan info and nothing else — say so, or users go
+        // looking for Trae usage in the dashboard that will never appear.
+        ? `- Trae SOLO: plan info only, no token usage (${traeStoragePath})`
+        : null,
+      traeEntitlement
+        ? `- Trae SOLO plan: ${formatTraeEntitlementLine(traeEntitlement)}`
         : null,
       ...(() => {
         if (!hermesInstalled) return [];

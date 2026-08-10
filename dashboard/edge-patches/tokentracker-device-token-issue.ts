@@ -17,6 +17,31 @@ function json(data: unknown, status = 200) {
   });
 }
 
+function isLeaderboardBlockedUser(userId: string): boolean {
+  return (Deno.env.get("LEADERBOARD_BLOCKED_USER_IDS") ?? "")
+    .split(",")
+    .some((candidate) => candidate.trim() === userId);
+}
+
+async function isUsageBlocked(
+  client: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<boolean> {
+  if (isLeaderboardBlockedUser(userId)) return true;
+  const { data, error } = await client.database
+    .from("tokentracker_leaderboard_anomaly_flags")
+    .select("user_id")
+    .eq("user_id", userId)
+    .eq("status", "auto_excluded")
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    console.error("[device-token-issue] anomaly guard failed:", error.message);
+    return false;
+  }
+  return Boolean(data);
+}
+
 function b64urlToBytes(s: string): Uint8Array<ArrayBuffer> {
   const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
   const pad = (4 - (b64.length % 4)) % 4;
@@ -137,6 +162,12 @@ export default async function (req: Request): Promise<Response> {
       anonKey,
       ...(anonKey ? { headers: { apikey: anonKey } } : {}),
     });
+  }
+
+  // A leaderboard ban must stop new uploads, not merely hide the account from
+  // the public snapshot. Check before touching devices or minting credentials.
+  if (await isUsageBlocked(dbClient, userId)) {
+    return json({ error: "Account blocked" }, 403);
   }
 
   const dataObj2 = body.data && typeof body.data === "object" ? (body.data as Record<string, unknown>) : undefined;

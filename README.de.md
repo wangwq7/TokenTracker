@@ -39,7 +39,7 @@ Sammle automatisch Token-Zahlen von **29 KI-Coding-Tools**, aggregiere sie lokal
 
 ## ⚡ Schnellstart
 
-> **Voraussetzungen**: Node.js **20+** (CLI läuft auf macOS / Linux / Windows; native Desktop-Apps gibt es für macOS (Menüleiste) und Windows (System Tray). Cursor-Token nutzt das systemeigene `sqlite3` CLI, wo verfügbar, und nutzt `node:sqlite` als Fallback auf unterstützten Node-Versionen).
+> **Voraussetzungen**: Node.js **20+** (CLI läuft auf macOS / Linux / Windows; native Desktop-Apps gibt es für macOS (Menüleiste), Windows (System Tray) und Linux (AppImage, Tray). Cursor-Token nutzt das systemeigene `sqlite3` CLI, wo verfügbar, und nutzt `node:sqlite` als Fallback auf unterstützten Node-Versionen).
 
 ```bash
 npx tokentracker-cli
@@ -57,6 +57,7 @@ Das war's. Beim ersten Start werden Hooks installiert, deine Daten synchronisier
 > **Möchtest du eine native Desktop-App?**
 > - **macOS** — [Lade `TokenTrackerBar.dmg` herunter](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTrackerBar.dmg) → in Programme ziehen. Menüleisten-Symbol, Desktop-Widgets und das Dashboard in einer WKWebView.
 > - **Windows** — [Lade `TokenTracker-Setup.exe` herunter](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-Setup.exe) → per-user Installer ausführen (kein Admin nötig). System-Tray-App mit Dashboard in WebView2. Portables Zip gibt's auf der [Releases-Seite](https://github.com/xiufengsun/TokenTracker/releases/latest).
+> - **Linux** — [Lade `TokenTracker-linux-x86_64.AppImage` herunter](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-linux-x86_64.AppImage) → `chmod +x` und starten. Tray-App mit Dashboard in einem WebKitGTK-Fenster. Benötigt `webkit2gtk-4.1`, `gtk3` und `libayatana-appindicator` aus deiner Distribution; unter GNOME braucht das Tray-Symbol zusätzlich die [AppIndicator-Erweiterung](https://extensions.gnome.org/extension/615/appindicator-support/).
 
 Für kürzere Befehle global installieren:
 

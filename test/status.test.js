@@ -147,6 +147,54 @@ test("status reports Codex notify unset when config points to another command", 
   }
 });
 
+test("status lists system and Cindy Codex roots including archived sessions", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-status-cindy-codex-"));
+  const previousEnv = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    APPDATA: process.env.APPDATA,
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
+    CODEX_HOME: process.env.CODEX_HOME,
+    TOKENTRACKER_CINDY_DATA_DIR: process.env.TOKENTRACKER_CINDY_DATA_DIR,
+    TOKENTRACKER_WSL_MODE: process.env.TOKENTRACKER_WSL_MODE,
+  };
+  const previousWrite = process.stdout.write;
+
+  try {
+    process.env.HOME = tmp;
+    process.env.USERPROFILE = tmp;
+    process.env.APPDATA = path.join(tmp, "AppData", "Roaming");
+    process.env.LOCALAPPDATA = path.join(tmp, "AppData", "Local");
+    const systemCodex = path.join(tmp, ".codex");
+    const cindyData = path.join(tmp, "Cindy");
+    const cindyCodex = path.join(cindyData, "codex-home");
+    process.env.CODEX_HOME = cindyCodex;
+    process.env.TOKENTRACKER_CINDY_DATA_DIR = cindyData;
+    process.env.TOKENTRACKER_WSL_MODE = "native-only";
+    await fs.mkdir(path.join(systemCodex, "sessions"), { recursive: true });
+    await fs.mkdir(path.join(cindyCodex, "archived_sessions"), { recursive: true });
+
+    let out = "";
+    process.stdout.write = (chunk, enc, cb) => {
+      out += typeof chunk === "string" ? chunk : chunk.toString(enc || "utf8");
+      if (typeof cb === "function") cb();
+      return true;
+    };
+
+    await cmdStatus();
+
+    assert.ok(out.includes(`native: ${path.join(systemCodex, "sessions")}`));
+    assert.ok(out.includes(`Cindy: ${path.join(cindyCodex, "archived_sessions")}`));
+  } finally {
+    process.stdout.write = previousWrite;
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("status JSON reports Copilot canonical store diagnostics", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-status-copilot-"));
   const prevHome = process.env.HOME;
@@ -372,6 +420,105 @@ test("status does not migrate legacy tracker directory", async () => {
     else process.env.USERPROFILE = prevUserProfile;
     if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = prevCodexHome;
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("status renders the Trae SOLO entitlement snapshot from Local State", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-status-trae-"));
+  const prevHome = process.env.HOME;
+  const prevUserProfile = process.env.USERPROFILE;
+  const prevCodexHome = process.env.CODEX_HOME;
+  const prevTraeHome = process.env.TOKENTRACKER_TRAE_HOME;
+  const prevWrite = process.stdout.write;
+
+  try {
+    process.env.HOME = tmp;
+    process.env.USERPROFILE = tmp;
+    process.env.CODEX_HOME = path.join(tmp, ".codex");
+    const traeHome = path.join(tmp, "trae-solo");
+    process.env.TOKENTRACKER_TRAE_HOME = traeHome;
+
+    // Trae install so detection reports installed.
+    await fs.mkdir(path.join(traeHome, "User", "globalStorage"), { recursive: true });
+    await fs.writeFile(
+      path.join(traeHome, "User", "globalStorage", "storage.json"),
+      JSON.stringify({
+        "iCubeServerData://icube.cloudide": JSON.stringify({
+          entitlementInfo: {
+            identityStr: "Pro",
+            identity: 3,
+            hasPackage: true,
+            isDollarUsageBilling: false,
+            proPeriod: "year",
+            enableSoloBuilder: true,
+            enableSoloCoder: false,
+            detail: { fastRequestPer: 20, inWaitlist: false },
+          },
+        }),
+      }),
+      "utf8",
+    );
+
+    const trackerDir = path.join(tmp, ".tokentracker", "tracker");
+    await fs.mkdir(trackerDir, { recursive: true });
+    await fs.writeFile(
+      path.join(trackerDir, "config.json"),
+      JSON.stringify({ baseUrl: "https://config.example", deviceToken: "t" }) + "\n",
+      "utf8",
+    );
+    // No source=trae queue row is needed: the entitlement render path reads
+    // the Trae Local State storage.json directly (queue is token-count-only).
+    await fs.writeFile(
+      path.join(trackerDir, "queue.state.json"),
+      JSON.stringify({ offset: 0 }) + "\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(trackerDir, "cursors.json"),
+      JSON.stringify({ updatedAt: "2026-08-07T01:30:00.000Z" }) + "\n",
+      "utf8",
+    );
+
+    let out = "";
+    process.stdout.write = (chunk, enc, cb) => {
+      out += typeof chunk === "string" ? chunk : chunk.toString(enc || "utf8");
+      if (typeof cb === "function") cb();
+      return true;
+    };
+
+    // --json: the summary must expose the entitlement under providers.trae.
+    await cmdStatus(["--json"]);
+    const summary = JSON.parse(out);
+    assert.equal(summary.providers.trae.installed, true);
+    assert.ok(summary.providers.trae.detail.endsWith("storage.json"));
+    assert.equal(summary.providers.trae.entitlement.identity, "Pro");
+    assert.equal(summary.providers.trae.entitlement.pro_period, "year");
+    assert.equal(summary.providers.trae.entitlement.enable_solo_builder, true);
+    assert.equal(summary.providers.trae.entitlement.fast_request_per, 20);
+    // captured_at is the storage.json mtime, not a queue hour_start.
+    assert.match(summary.providers.trae.entitlement.captured_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+    // Text render: the plan line must describe the snapshot.
+    out = "";
+    await cmdStatus();
+    // Not "passive reader" — that wording means "tokens are counted" on every
+    // other provider line, and Trae contributes no usage at all.
+    assert.match(out, /- Trae SOLO: plan info only, no token usage \(/);
+    assert.doesNotMatch(out, /- Trae SOLO: passive reader/);
+    assert.match(out, /- Trae SOLO plan: plan Pro, year period, package billing/);
+    assert.match(out, /20 fast requests\/hr/);
+    assert.match(out, /snapshot \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/);
+  } finally {
+    process.stdout.write = prevWrite;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevUserProfile;
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    if (prevTraeHome === undefined) delete process.env.TOKENTRACKER_TRAE_HOME;
+    else process.env.TOKENTRACKER_TRAE_HOME = prevTraeHome;
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });

@@ -458,10 +458,12 @@ async function cmdSync(argv, context = {}) {
     process.stderr.write(await recordSyncSkip(trackerDir, lockPath));
     return;
   }
-  await clearSyncSkip(trackerDir);
-
   let progress = null;
   try {
+    // Marker cleanup can fail for reasons other than ENOENT (permissions, or a
+    // directory replacing the expected file). Keep it inside the lease's
+    // try/finally so an auxiliary diagnostic never strands the sync lock.
+    await clearSyncSkip(trackerDir);
     progress = !opts.auto ? createProgress({ stream: process.stdout }) : null;
     const configPath = path.join(trackerDir, "config.json");
     const cursorsPath = path.join(trackerDir, "cursors.json");
@@ -655,18 +657,32 @@ async function cmdSync(argv, context = {}) {
       const configuredCodexIsCindy = Boolean(
         process.env.CODEX_HOME && cindyCodexKeys.has(pathIdentity(process.env.CODEX_HOME)),
       );
-      const wslCodexDir = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
-        ? wsl.discoverWslHome(".codex")
-        : null;
       // resolveInstallPaths stays the single authority for wsl-first /
       // native-first / wsl-only / native-only / both selection; requireAnyChild
       // makes it validate that a candidate actually holds sessions/ or
       // archived_sessions/ so an empty WSL ~/.codex shell cannot shadow the
       // native install (issue #codex-wsl-shadow).
+      //
+      // Pass `wslDir` rather than a pre-resolved home so requireAnyChild is
+      // folded INTO the discovery probe: discoverWslHome returns the first
+      // distro whose ~/.codex merely exists, so resolving it here first meant a
+      // bare shell in an earlier distro won, got rejected as unpopulated, and
+      // the populated later distro was never looked at — the same shadowing bug
+      // one level down, and a silent disagreement with status.js.
+      //
+      // union: both installs are real usage on this machine, so a preference
+      // mode must not delete one of them. Before this, a populated WSL
+      // ~/.codex evicted the native install entirely under the default
+      // wsl-first — the session browser (which walks every root, see
+      // session-analytics.js providerRoots) showed those Codex sessions while
+      // the dashboard counted none of their tokens. Safe because the parser
+      // dedups Codex events by sessionUUID:eventTimestamp, so the same session
+      // seen under two path spellings collapses instead of double-counting.
       const codexPaths = resolveInstallPaths({
         nativeValue: codexNativeValue,
-        wslValue: wslCodexDir,
+        wslDir: ".codex",
         requireAnyChild: ["sessions", "archived_sessions"],
+        union: true,
       });
       if (configuredCodexIsCindy) {
         sources.push({ source: "codex", sessionsDir: path.join(home, ".codex", "sessions"), codexInventoryCache: true });

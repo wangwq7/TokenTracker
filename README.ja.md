@@ -39,7 +39,7 @@
 
 ## ⚡ クイックスタート
 
-> **動作要件**: Node.js **20+**（CLI は macOS / Linux / Windows で動作します。ネイティブデスクトップアプリは macOS（メニューバー）と Windows（システムトレイ）の両方を提供します。Cursor のトークン読み取りは、利用可能であればシステムの `sqlite3` CLI を使用し、対応する Node リリースでは `node:sqlite` にフォールバックします）。
+> **動作要件**: Node.js **20+**（CLI は macOS / Linux / Windows で動作します。ネイティブデスクトップアプリは macOS（メニューバー）、Windows（システムトレイ）、Linux（AppImage、トレイ）を提供します。Cursor のトークン読み取りは、利用可能であればシステムの `sqlite3` CLI を使用し、対応する Node リリースでは `node:sqlite` にフォールバックします）。
 
 ```bash
 npx tokentracker-cli
@@ -56,6 +56,7 @@ npx tokentracker-cli
 > **ネイティブのデスクトップアプリが欲しい?**
 > - **macOS** — [`TokenTrackerBar.dmg` をダウンロード](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTrackerBar.dmg) → Applications にドラッグ。デスクトップウィジェット、メニューバーのステータスアイコン、WKWebView 上の同じダッシュボードを含みます。
 > - **Windows** — [`TokenTracker-Setup.exe` をダウンロード](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-Setup.exe) → 管理者権限不要のユーザー単位インストーラーを実行。WebView2 上にダッシュボードを表示するシステムトレイアプリです。ポータブル版 zip は[リリースページ](https://github.com/xiufengsun/TokenTracker/releases/latest)にあります。
+> - **Linux** — [`TokenTracker-linux-x86_64.AppImage` をダウンロード](https://github.com/xiufengsun/TokenTracker/releases/latest/download/TokenTracker-linux-x86_64.AppImage) → `chmod +x` して実行。WebKitGTK ウィンドウにダッシュボードを表示するトレイアプリです。ディストリの `webkit2gtk-4.1`、`gtk3`、`libayatana-appindicator` が必要で、GNOME ではトレイアイコンに [AppIndicator 拡張機能](https://extensions.gnome.org/extension/615/appindicator-support/)も必要です。
 
 短いコマンドで使うためグローバルインストール:
 

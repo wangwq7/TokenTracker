@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const fs = require("node:fs");
 const path = require("node:path");
+const { assertReleaseVersion } = require("../scripts/version-files.cjs");
 
 const WORKFLOW_PATH = path.join(
   __dirname,
@@ -10,6 +11,7 @@ const WORKFLOW_PATH = path.join(
   "workflows",
   "npm-publish.yml"
 );
+const CI_WORKFLOW_PATH = path.join(__dirname, "..", ".github", "workflows", "ci.yml");
 
 function loadWorkflow() {
   return fs.readFileSync(WORKFLOW_PATH, "utf8");
@@ -27,6 +29,14 @@ test("workflow triggers only after canonical CI completes on main", () => {
   assert.ok(
     content.includes("branches: [main]"),
     "should target main branch only"
+  );
+});
+
+test("canonical CI never cancels an in-flight main version commit", () => {
+  const content = fs.readFileSync(CI_WORKFLOW_PATH, "utf8");
+  assert.ok(
+    content.includes("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"),
+    "main CI runs must survive later pushes so npm remains pinned to the version commit",
   );
 });
 
@@ -50,6 +60,7 @@ test("successful push CI gates publish and the exact tested SHA is checked out",
     content.includes("ref: ${{ github.event.workflow_run.head_sha }}"),
     "publish must build the exact commit that passed CI"
   );
+  assert.ok(content.includes("fetch-depth: 2"), "publish must inspect the tested commit's parent");
   assert.ok(!content.includes("\n  test:"), "must not maintain a weaker duplicate test job");
 });
 
@@ -67,6 +78,51 @@ test("workflow checks version before publishing", () => {
     content.includes("npm view tokentracker-cli"),
     "should check if version already exists on npm"
   );
+  assert.ok(
+    content.includes("git show HEAD^:package.json"),
+    "only the tested commit that changed package.json may publish"
+  );
+  assert.ok(
+    content.includes("outputs.eligible == 'true'"),
+    "publish steps must require an exact version-changing commit"
+  );
+  assert.ok(content.includes("set -euo pipefail"), "provenance checks must fail closed");
+  assert.ok(
+    !content.includes("JSON.parse(s).version||'')}catch{}})\" || true"),
+    "parent version lookup must not swallow checkout or JSON errors",
+  );
+  assert.ok(
+    content.includes('r?.error?.code') && content.includes('= "E404"'),
+    "only a confirmed npm E404 may be treated as unpublished",
+  );
+  assert.ok(
+    content.includes("npm registry lookup failed without a confirmed E404"),
+    "other registry failures must stop publication",
+  );
+  assert.ok(
+    content.includes("assertReleaseVersion(process.argv[1]") &&
+      content.includes("assertReleaseVersion(process.argv[2]"),
+    "current and parent package versions must be validated before npm lookup",
+  );
+});
+
+test("workflow skip notices are reason-specific and avoid expression injection", () => {
+  const content = loadWorkflow();
+  assert.ok(content.includes("Skip unchanged-version commit"));
+  assert.ok(content.includes("Skip already-published version"));
+  assert.ok(content.includes("PACKAGE_VERSION: ${{ steps.version-check.outputs.version }}"));
+  assert.ok(
+    !content.includes('run: echo "v${{ steps.version-check.outputs.version }}'),
+    "step outputs must not be interpolated directly into shell source",
+  );
+});
+
+test("publish version validation rejects malformed current and parent versions", () => {
+  assert.equal(assertReleaseVersion("0.88.3", "current"), "0.88.3");
+  for (const invalid of ["", "v0.88.3", "0.88", "0.88.3-beta.1", "01.2.3"]) {
+    assert.throws(() => assertReleaseVersion(invalid, "current"), /stable x\.y\.z/);
+    assert.throws(() => assertReleaseVersion(invalid, "parent"), /stable x\.y\.z/);
+  }
 });
 
 test("workflow builds dashboard before publish", () => {
