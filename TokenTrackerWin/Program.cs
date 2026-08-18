@@ -4,6 +4,7 @@ internal static class Program
 {
     // Stable per-user mutex name so a second launch just exits.
     private const string SingleInstanceMutexName = "TokenTracker.Windows.Tray.SingleInstance";
+    private const int WpfRenderThreadFailureHResult = unchecked((int)0x88980406);
 
     [STAThread]
     private static void Main(string[] args)
@@ -37,7 +38,30 @@ internal static class Program
         // dispatcher context. We never call its Run(); the WinForms message pump below
         // drives the shared STA thread (and the WPF Dispatcher rides on it). Explicit
         // shutdown mode so WPF doesn't tear itself down when the window is hidden.
-        _ = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+        // The borderless dashboard and transparent pet use WPF + DirectComposition.
+        // After a long display-sleep/idle cycle, WPF's hardware render thread can fail
+        // while the tray restores one of those windows (UCEERR_RENDERTHREADFAILURE),
+        // which otherwise terminates the entire tray process from KERNELBASE.dll.
+        // WebView2 keeps its own compositor; this only moves WPF's host chrome/layout
+        // to the recoverable software path.
+        System.Windows.Media.RenderOptions.ProcessRenderMode =
+            System.Windows.Interop.RenderMode.SoftwareOnly;
+        var wpfApp = new System.Windows.Application
+        {
+            ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown,
+        };
+        wpfApp.DispatcherUnhandledException += (_, e) =>
+        {
+            Diag.Log("program",
+                $"WPF dispatcher exception type={e.Exception.GetType().Name} "
+                + $"hresult=0x{e.Exception.HResult:X8}: {e.Exception.Message}");
+            if (e.Exception is System.Runtime.InteropServices.COMException com
+                && com.HResult == WpfRenderThreadFailureHResult)
+            {
+                e.Handled = true;
+                Diag.Log("program", "handled WPF render-thread failure");
+            }
+        };
 
         ApplicationConfiguration.Initialize();
         // Show the desktop pet on a normal launch (manual run or post-install), but stay
