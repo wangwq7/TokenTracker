@@ -39,13 +39,13 @@ internal static class Program
         // drives the shared STA thread (and the WPF Dispatcher rides on it). Explicit
         // shutdown mode so WPF doesn't tear itself down when the window is hidden.
         // The borderless dashboard and transparent pet use WPF + DirectComposition.
+        // Keep WPF's default hardware path: WebView2CompositionControl presents its
+        // browser surface through a WPF D3DImage, which is blank when WPF is forced
+        // onto SoftwareOnly rendering.
         // After a long display-sleep/idle cycle, WPF's hardware render thread can fail
         // while the tray restores one of those windows (UCEERR_RENDERTHREADFAILURE),
-        // which otherwise terminates the entire tray process from KERNELBASE.dll.
-        // WebView2 keeps its own compositor; this only moves WPF's host chrome/layout
-        // to the recoverable software path.
-        System.Windows.Media.RenderOptions.ProcessRenderMode =
-            System.Windows.Interop.RenderMode.SoftwareOnly;
+        // so keep the dispatcher guard below to prevent a recoverable render exception
+        // from terminating the entire tray process.
         var wpfApp = new System.Windows.Application
         {
             ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown,
